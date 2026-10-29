@@ -1,0 +1,26 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Downloaded Games & Temporary Scratches
+scratch/
+The_DICKtator-*/
+Just_One_More_Chance/
+downloaded_game_*/
+*-v*/
+*.part
+scraper_old.py
+start_live_server.py
+todo.md
+
+# Environment & IDE
+.vscode/
+.idea/
+.gemini/
