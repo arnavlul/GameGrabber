@@ -1320,7 +1320,13 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
         browser.close()
 
     # 5. Determine output folder and check for version compatibility
-    target_folder = output_folder if output_folder else default_folder
+    base_download_dir = "downloads"
+    os.makedirs(base_download_dir, exist_ok=True)
+    if output_folder:
+        target_folder = output_folder if (os.path.isabs(output_folder) or output_folder.startswith(("downloads/", "downloads\\"))) else os.path.join(base_download_dir, output_folder)
+    else:
+        target_folder = os.path.join(base_download_dir, default_folder)
+
     meta_path = os.path.join(target_folder, "game_meta.json")
 
     if os.path.exists(meta_path):
@@ -1334,7 +1340,7 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
                 print(f"[!] VERSION MISMATCH DETECTED:")
                 print(f"    Existing download in '{target_folder}' is version: {prev_version}")
                 print(f"    Remote game is newer version: {detected_version}")
-                new_folder = f"{clean_title}-{detected_version}"
+                new_folder = os.path.join(base_download_dir, f"{clean_title}-{detected_version}")
                 print(f"[*] Resuming in separate folder '{new_folder}' to prevent data corruption!")
                 print("=" * 75 + "\n")
                 target_folder = new_folder
@@ -1725,7 +1731,7 @@ Examples:
     )
 
     parser.add_argument("url", help="Target URL (Game portal page URL or direct game iframe/CDN URL)")
-    parser.add_argument("-o", "--folder", "--out", dest="folder", type=str, metavar="NAME", help="Custom output directory name (default: auto-named '<Game_Name>-<Version>')")
+    parser.add_argument("-o", "--folder", "--out", dest="folder", type=str, metavar="NAME", help="Custom output directory name (default: auto-named 'downloads/<Game_Name>-<Version>')")
     parser.add_argument("--play-now", "--stream", dest="play_now", action="store_true", help="Play immediately! Starts an on-demand caching server and streams missing assets live while downloading in background")
     parser.add_argument("--stream-only", "--lazy", dest="stream_only", action="store_true", help="Conserve bandwidth: launches game server and streams assets ONLY on-demand as you play (disables background pre-downloading)")
     parser.add_argument("--no-videos", "--images-only", dest="no_videos", action="store_true", help="Conserve bandwidth: downloads all images/audio/text but skips heavy video files (.mp4/.webm)")
