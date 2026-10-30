@@ -83,6 +83,34 @@ def normalize_url(raw_url):
 
     return raw
 
+def clean_mojibake(text: str) -> str:
+    """
+    Detects and fixes UTF-8 -> Latin-1 mojibake (e.g. 'â€™' -> '’', 'Î¡' -> '\ue821', etc.)
+    caused when web servers omit charset headers or decode UTF-8 as ISO-8859-1.
+    """
+    if not text:
+        return text
+
+    signatures = ('\u00e2\u0080', '\u00ee\u00a0', '\u00c3\u0082', '\u00c3\u0083', '\u00c2\u00a0\u00c2\u00a0', 'â\x80')
+    if any(sig in text for sig in signatures):
+        # 1. Try full string reversal
+        try:
+            return text.encode('latin1').decode('utf-8')
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+
+        # 2. Fallback: regex replace high-byte sequences in mixed content
+        def repl(m):
+            chunk = m.group(0)
+            try:
+                return chunk.encode('latin1').decode('utf-8')
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                return chunk
+
+        return re.sub(r'[\u0080-\u00ff]{2,}', repl, text)
+
+    return text
+
 def sanitize_name(name):
     clean = re.sub(r'[<>:"/\\|?*]+', '_', name).strip('. _')
     clean = re.sub(r'\s+', '_', clean)
@@ -1051,6 +1079,13 @@ class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
 
 class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
+    def guess_type(self, path):
+        ctype = super().guess_type(path)
+        if ctype and (ctype.startswith('text/') or ctype in ('application/javascript', 'application/json')):
+            if 'charset=' not in ctype:
+                ctype += '; charset=utf-8'
+        return ctype
+
     def end_headers(self):
         self.send_header('Accept-Ranges', 'bytes')
         super().end_headers()
@@ -1075,6 +1110,9 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
         content_type, _ = mimetypes.guess_type(local_path)
         if not content_type:
             content_type = 'application/octet-stream'
+        elif content_type.startswith('text/') or content_type in ('application/javascript', 'application/json'):
+            if 'charset=' not in content_type:
+                content_type += '; charset=utf-8'
 
         range_header = self.headers.get('Range')
         if range_header and range_header.startswith('bytes='):
@@ -1121,6 +1159,13 @@ class OnDemandCachingServer:
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, directory=target_folder, **kwargs)
 
+            def guess_type(self, path):
+                ctype = super().guess_type(path)
+                if ctype and (ctype.startswith('text/') or ctype in ('application/javascript', 'application/json')):
+                    if 'charset=' not in ctype:
+                        ctype += '; charset=utf-8'
+                return ctype
+
             def log_message(self, format, *args):
                 pass  # Suppress routine GET logging
 
@@ -1138,6 +1183,9 @@ class OnDemandCachingServer:
                 content_type, _ = mimetypes.guess_type(local_path)
                 if not content_type:
                     content_type = "application/octet-stream"
+                elif content_type.startswith("text/") or content_type in ("application/javascript", "application/json"):
+                    if "charset=" not in content_type:
+                        content_type += "; charset=utf-8"
 
                 range_header = self.headers.get("Range")
                 if range_header and range_header.startswith("bytes="):
@@ -1480,12 +1528,23 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
     pristine_html = None
     try:
         r_orig = session.get(game_url, verify=verify_ssl, timeout=10)
-        if r_orig.status_code == 200 and len(r_orig.text) > 1000:
-            pristine_html = r_orig.text
+        if r_orig.status_code == 200 and len(r_orig.content) > 1000:
+            # Modern HTML5 and SugarCube web games are encoded in UTF-8.
+            # Avoid r_orig.text as requests defaults to ISO-8859-1 when headers omit charset.
+            try:
+                pristine_html = r_orig.content.decode('utf-8')
+            except UnicodeDecodeError:
+                pristine_html = r_orig.content.decode(r_orig.apparent_encoding or 'utf-8', errors='replace')
     except Exception:
         pass
 
     final_html = pristine_html if pristine_html else page_html
+    final_html = clean_mojibake(final_html)
+
+    # Ensure <meta charset="utf-8"> is in <head>
+    if "<head" in final_html.lower() and "charset" not in final_html[:3000].lower():
+        final_html = re.sub(r'(<head[^>]*>)', r'\1\n  <meta charset="utf-8">', final_html, count=1, flags=re.I)
+
     for ext_url, local_rel in external_assets.items():
         final_html = final_html.replace(ext_url, local_rel)
 
@@ -1511,6 +1570,13 @@ import webbrowser
 from urllib.parse import urlparse, unquote
 
 class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
+    def guess_type(self, path):
+        ctype = super().guess_type(path)
+        if ctype and (ctype.startswith('text/') or ctype in ('application/javascript', 'application/json')):
+            if 'charset=' not in ctype:
+                ctype += '; charset=utf-8'
+        return ctype
+
     def end_headers(self):
         self.send_header('Accept-Ranges', 'bytes')
         super().end_headers()
@@ -1535,6 +1601,9 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
         content_type, _ = mimetypes.guess_type(local_path)
         if not content_type:
             content_type = 'application/octet-stream'
+        elif content_type.startswith('text/') or content_type in ('application/javascript', 'application/json'):
+            if 'charset=' not in content_type:
+                content_type += '; charset=utf-8'
 
         range_header = self.headers.get('Range')
         if range_header and range_header.startswith('bytes='):
