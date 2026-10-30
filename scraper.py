@@ -468,9 +468,9 @@ class SugarCubeHandler:
         external_assets = {}
         unescaped = html.unescape(html_content)
 
-        image_prefix = "images/"
-        sound_prefix = "sounds/"
-        video_prefix = "videos/"
+        image_prefix = ""
+        sound_prefix = ""
+        video_prefix = ""
 
         setup_meta = metadata.get("metadata", {}).get("setup", {}) if isinstance(metadata, dict) else {}
         if setup_meta:
@@ -576,14 +576,16 @@ class SugarCubeHandler:
             if not c:
                 return None
             c_lower = c.lower()
+            if c_lower.startswith(('images/', 'img/', 'videos/', 'video/', 'sounds/', 'sound/', 'audio/', 'media/', 'assets/')):
+                return c
             if c_lower.endswith(vid_exts):
-                if video_prefix and not c_lower.startswith(video_prefix.lower()) and not c_lower.startswith(('videos/', 'media/')):
+                if video_prefix and not c_lower.startswith(video_prefix.lower()):
                     c = (video_prefix + c).replace('\\', '/')
             elif c_lower.endswith(img_exts):
-                if image_prefix and not c_lower.startswith(image_prefix.lower()) and not c_lower.startswith(('images/', 'img/')):
+                if image_prefix and not c_lower.startswith(image_prefix.lower()):
                     c = (image_prefix + c).replace('\\', '/')
             elif c_lower.endswith(snd_exts):
-                if sound_prefix and not c_lower.startswith(sound_prefix.lower()) and not c_lower.startswith(('sounds/', 'audio/')):
+                if sound_prefix and not c_lower.startswith(sound_prefix.lower()):
                     c = (sound_prefix + c).replace('\\', '/')
             return c
 
@@ -953,7 +955,12 @@ class AssetDownloader:
         limit_info = f" (Max download limit: {self.max_mb:.1f} MB)" if self.max_mb else ""
         print(f"[*] Starting download of {total} assets with {self.max_workers} worker threads{limit_info}...")
 
-        items_iter = iter(asset_map.items())
+        # Prioritize files that have existing .part chunks so interrupted downloads finish first
+        sorted_items = sorted(
+            asset_map.items(),
+            key=lambda item: 0 if os.path.exists(os.path.join(self.download_folder, item[0]) + ".part") else 1
+        )
+        items_iter = iter(sorted_items)
         active_futures = {}
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
