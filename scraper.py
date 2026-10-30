@@ -60,6 +60,8 @@ def normalize_url(raw_url):
         raw = re.sub(r'^[a-z]+(?=https?://)', '', raw, flags=re.I)
     elif re.match(r'^https?:/([^/])', raw, re.I):
         raw = re.sub(r'^(https?:)/', r'\1//', raw, flags=re.I)
+    elif raw.startswith('//'):
+        raw = 'https:' + raw
     elif not raw.startswith(('http://', 'https://')):
         raw = 'https://' + raw
 
@@ -468,6 +470,7 @@ class SugarCubeHandler:
 
         image_prefix = "images/"
         sound_prefix = "sounds/"
+        video_prefix = "videos/"
 
         setup_meta = metadata.get("metadata", {}).get("setup", {}) if isinstance(metadata, dict) else {}
         if setup_meta:
@@ -476,15 +479,19 @@ class SugarCubeHandler:
             if setup_meta.get("SoundPath"):
                 sound_prefix = setup_meta["SoundPath"].lstrip('/')
 
-        m_img = re.search(r'setup\.ImagePath\s*=\s*(?:setup\.Path\s*\+\s*)?[\'"]([^\'"]*)[\'"]', unescaped)
+        m_img = re.search(r'(?:setup\.ImagePath|window\.imageBaseUrl|imageBaseUrl)\s*=\s*(?:setup\.Path\s*\+\s*)?[\'"]([^\'"]*)[\'"]', unescaped)
         if m_img:
             image_prefix = m_img.group(1).lstrip('/')
 
-        m_snd = re.search(r'setup\.SoundPath\s*=\s*(?:setup\.Path\s*\+\s*)?[\'"]([^\'"]*)[\'"]', unescaped)
+        m_vid = re.search(r'(?:setup\.VideoPath|window\.videoBaseUrl|videoBaseUrl)\s*=\s*(?:setup\.Path\s*\+\s*)?[\'"]([^\'"]*)[\'"]', unescaped)
+        if m_vid:
+            video_prefix = m_vid.group(1).lstrip('/')
+
+        m_snd = re.search(r'(?:setup\.SoundPath|window\.soundBaseUrl|window\.audioBaseUrl|soundBaseUrl|audioBaseUrl)\s*=\s*(?:setup\.Path\s*\+\s*)?[\'"]([^\'"]*)[\'"]', unescaped)
         if m_snd:
             sound_prefix = m_snd.group(1).lstrip('/')
 
-        print(f"[+] SugarCube Setup paths -> imagePrefix: '{image_prefix}', soundPrefix: '{sound_prefix}'")
+        print(f"[+] SugarCube Setup paths -> imagePrefix: '{image_prefix}', videoPrefix: '{video_prefix}', soundPrefix: '{sound_prefix}'")
 
         # 1. Parse passages with PID and Name
         passages_raw = re.findall(r'<tw-passagedata[^>]*pid="([^"]*)"[^>]*name="([^"]*)"[^>]*>(.*?)</tw-passagedata>', html_content, re.DOTALL)
@@ -560,6 +567,26 @@ class SugarCubeHandler:
                 visited_passages.add(name)
                 ordered_passages.append(name)
 
+        vid_exts = ('.mp4', '.webm', '.avi', '.mov', '.mkv', '.m4v')
+        img_exts = ('.png', '.jpg', '.jpeg', '.webp', '.svg', '.gif', '.bmp', '.ico', '.avif')
+        snd_exts = ('.mp3', '.ogg', '.wav', '.flac', '.m4a', '.aac', '.opus')
+
+        def resolve_media_path(raw_path):
+            c = clean_relative_path(raw_path)
+            if not c:
+                return None
+            c_lower = c.lower()
+            if c_lower.endswith(vid_exts):
+                if video_prefix and not c_lower.startswith(video_prefix.lower()) and not c_lower.startswith(('videos/', 'media/')):
+                    c = (video_prefix + c).replace('\\', '/')
+            elif c_lower.endswith(img_exts):
+                if image_prefix and not c_lower.startswith(image_prefix.lower()) and not c_lower.startswith(('images/', 'img/')):
+                    c = (image_prefix + c).replace('\\', '/')
+            elif c_lower.endswith(snd_exts):
+                if sound_prefix and not c_lower.startswith(sound_prefix.lower()) and not c_lower.startswith(('sounds/', 'audio/')):
+                    c = (sound_prefix + c).replace('\\', '/')
+            return c
+
         # 5. Extract assets per passage in story progression order
         def extract_passage_media(text):
             imgs = []
@@ -572,9 +599,9 @@ class SugarCubeHandler:
                     p = urlparse(val)
                     external_assets[val] = f"external/{p.netloc}{p.path}"
                 else:
-                    c = clean_relative_path(val)
+                    c = resolve_media_path(val)
                     if c:
-                        if c.lower().endswith(('.mp4', '.webm', '.avi', '.mov')):
+                        if c.lower().endswith(vid_exts):
                             vids.append(c)
                         else:
                             imgs.append(c)
@@ -585,39 +612,50 @@ class SugarCubeHandler:
                     part = part.strip()
                     if '|' in part:
                         part = part.split('|', 1)[1].strip()
-                    c = clean_relative_path(part)
+                    c = resolve_media_path(part)
                     if c:
-                        if not c.lower().startswith(('images/', 'videos/', 'sounds/', 'audio/')) and '/' not in c:
-                            c = (image_prefix + c).replace('\\', '/')
-                        if c.lower().endswith(('.mp4', '.webm', '.avi', '.mov')):
+                        if c.lower().endswith(vid_exts):
                             vids.append(c)
                         else:
                             imgs.append(c)
 
-            # SugarCube macro tags (<<video "path">>, <<audio "path">>)
-            for m in re.finditer(r'<<(?:video|audio)\s+[\'"]([^\'"]+)[\'"]', text, re.I):
-                c = clean_relative_path(m.group(1))
+            # SugarCube macro tags (<<video>>, <<imgbg>>, <<videobg>>, <<char>>, etc.)
+            for m in re.finditer(r'<<(?:video|audio|vid|videobg|img|imgbg|char|instapost)\s+[\'"]([^\'"]+)[\'"]', text, re.I):
+                c = resolve_media_path(m.group(1))
                 if c:
-                    if c.lower().endswith(('.mp4', '.webm', '.avi', '.mov')):
+                    if c.lower().endswith(vid_exts):
                         vids.append(c)
                     else:
                         imgs.append(c)
 
+            # Quoted strings with media extensions inside the passage
+            ext_pattern = '|'.join(MEDIA_EXTENSIONS)
+            for m in re.finditer(r'[\'"]([^\'"\r\n\t<>]+\.(?:' + ext_pattern + r'))[\'"]', text, re.I):
+                val = m.group(1).strip()
+                if val.startswith(('http://', 'https://')):
+                    p = urlparse(val)
+                    external_assets[val] = f"external/{p.netloc}{p.path}"
+                else:
+                    c = resolve_media_path(val)
+                    if c:
+                        if c.lower().endswith(vid_exts):
+                            vids.append(c)
+                        else:
+                            imgs.append(c)
+
             # Audio macros
             for m in re.finditer(r'<<cacheaudio\s+[\'"][^\'"]+[\'"]\s+[\'"]([^\'"]+)[\'"]', text):
-                c = clean_relative_path(m.group(1))
+                c = resolve_media_path(m.group(1))
                 if c:
-                    if not c.lower().startswith(('sounds/', 'audio/')) and '/' not in c:
-                        c = (sound_prefix + c).replace('\\', '/')
                     imgs.append(c)
 
             # Setup paths
             for m in re.finditer(r'setup\.ImagePath\s*\+\s*[\'"]([^\'"]+)[\'"]', text):
-                c = clean_relative_path((image_prefix + m.group(1).lstrip('/')).replace('\\', '/'))
+                c = resolve_media_path(m.group(1).lstrip('/'))
                 if c:
                     imgs.append(c)
             for m in re.finditer(r'setup\.SoundPath\s*\+\s*[\'"]([^\'"]+)[\'"]', text):
-                c = clean_relative_path((sound_prefix + m.group(1).lstrip('/')).replace('\\', '/'))
+                c = resolve_media_path(m.group(1).lstrip('/'))
                 if c:
                     imgs.append(c)
 
@@ -640,14 +678,14 @@ class SugarCubeHandler:
                     discovered_assets.append(vid)
 
         # Step B: Fallback regex scan across global unescaped HTML/scripts
-        media_regex = re.compile(r'([a-zA-Z0-9_\-./\s]+\.(?:' + '|'.join(MEDIA_EXTENSIONS) + r'))', re.I)
-        for m in media_regex.finditer(unescaped):
+        ext_pattern = '|'.join(MEDIA_EXTENSIONS)
+        for m in re.finditer(r'[\'"]([^\'"\r\n\t<>]+\.(?:' + ext_pattern + r'))[\'"]', unescaped, re.I):
             token = m.group(1).strip('\'" \t\r\n')
             if token.startswith(('http://', 'https://')):
                 p = urlparse(token)
                 external_assets[token] = f"external/{p.netloc}{p.path}"
             else:
-                c = clean_relative_path(token)
+                c = resolve_media_path(token)
                 if c and c not in seen_assets:
                     seen_assets.add(c)
                     discovered_assets.append(c)
@@ -1644,8 +1682,8 @@ except KeyboardInterrupt:
             json.dump(meta, f, indent=2)
 
         print("=" * 75)
-        print(" [✓] 100% of prioritized game assets have been downloaded and cached locally! ")
-        print(" [✓] The game is now fully offline-playable anytime via run_game.bat. ")
+        print(" [+] 100% of prioritized game assets have been downloaded and cached locally! ")
+        print(" [+] The game is now fully offline-playable anytime via run_game.bat. ")
         print("=" * 75)
 
     if play_now and httpd:

@@ -12,6 +12,7 @@ __pycache__/
 # Downloaded Games & Temporary Scratches
 downloads/
 scratch/
+completed_links.txt
 *-v*/
 *.part
 
