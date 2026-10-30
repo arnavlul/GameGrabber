@@ -54,7 +54,7 @@ AD_DOMAINS = [
 ]
 
 def normalize_url(raw_url):
-    """Cleans up typos in URL strings, such as thttps:// or missing scheme."""
+    """Cleans up typos in URL strings, such as thttps:// or missing scheme, and sanitizes invalid domain characters."""
     raw = raw_url.strip('\'" \t\r\n')
     if re.match(r'^[a-z]+https?://', raw, re.I):
         raw = re.sub(r'^[a-z]+(?=https?://)', '', raw, flags=re.I)
@@ -62,6 +62,23 @@ def normalize_url(raw_url):
         raw = re.sub(r'^(https?:)/', r'\1//', raw, flags=re.I)
     elif not raw.startswith(('http://', 'https://')):
         raw = 'https://' + raw
+
+    try:
+        parsed = urlparse(raw)
+        host = parsed.netloc or ""
+        lower_host = host.lower()
+        new_host = host
+        if lower_host.endswith(".fgn.cdn.serverable.com") or lower_host.endswith(".serverable.com"):
+            new_host = "fgn.cdn.serverable.com"
+        elif lower_host.endswith(".discretehosting.com"):
+            new_host = "discretehosting.com"
+        elif "_" in host:
+            new_host = host.replace("_", "-")
+        if new_host != host:
+            raw = urlunparse((parsed.scheme, new_host, parsed.path, parsed.params, parsed.query, parsed.fragment))
+    except Exception:
+        pass
+
     return raw
 
 def sanitize_name(name):
