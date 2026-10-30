@@ -20,6 +20,7 @@ import mimetypes
 import urllib3
 import requests
 import webbrowser
+import threading
 import http.server
 import socketserver
 from datetime import datetime
@@ -38,7 +39,8 @@ MEDIA_EXTENSIONS = {
     'mp4', 'webm', 'ogv',
     'wasm', 'data', 'mem', 'zip', 'rpa', 'pak',
     'woff', 'woff2', 'ttf', 'otf', 'eot',
-    'json', 'xml', 'txt', 'csv'
+    'json', 'xml', 'txt', 'csv',
+    'rpgmvp', 'rpgmvo', 'rpgmvm', 'png_', 'ogg_', 'm4a_'
 }
 
 CODE_EXTENSIONS = {'js', 'css', 'html', 'htm'}
@@ -127,18 +129,56 @@ def extract_game_identity(title, url, html_content=""):
     return clean_title, version, folder_name
 
 def clean_relative_path(path):
-    path = path.strip('\'" \t\r\n')
-    if any(c in path for c in ['<', '>', '$', '{', '}', ';', '+', '*', '\n', '\r', '|', '"']):
+    if not path:
         return None
-    path = path.split('?')[0].split('#')[0]
-    path = path.replace('\\', '/').lstrip('/')
-    if not path or '..' in path:
+    path = html.unescape(str(path)).strip('\'" \t\r\n')
+    if not path:
         return None
-    if '.' not in path:
+
+    lower_start = path.lower()
+    if lower_start.startswith(('data:', 'blob:', 'javascript:', 'mailto:', '#', 'about:', 'http://', 'https://', '//')):
         return None
-    ext = path.rsplit('.', 1)[-1].lower()
+
+    if any(c in path for c in ['<', '>', '$', '{', '}', ';', '*', '\n', '\r', '|', '"']):
+        return None
+
+    path = path.split('?')[0].split('#')[0].strip()
+    path = path.replace('\\', '/')
+    if not path:
+        return None
+
+    # Safe percent-decoding preserving '+'
+    path = unquote(path.replace('+', '%2B')).replace('\\', '/').strip()
+    norm_segs = []
+    for seg in path.split('/'):
+        if not seg or seg == '.':
+            continue
+        if seg == '..':
+            if norm_segs:
+                norm_segs.pop()
+        else:
+            norm_segs.append(seg)
+    if not norm_segs:
+        return None
+
+    # Protect against Windows reserved device names
+    base_name = os.path.splitext(norm_segs[-1])[0].upper()
+    if re.match(r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$', base_name):
+        norm_segs[-1] = '_' + norm_segs[-1]
+
+    path = '/'.join(norm_segs)
+
+    # Filter dummy placeholders
+    lower = path.lower()
+    if lower in ['movie.ogg', 'movie.mp4', 'dummy.mp4', 'video.ogg'] or lower.endswith(('/movie.ogg', '/movie.mp4')):
+        return None
+
+    if '.' not in lower:
+        return None
+    ext = lower.rsplit('.', 1)[-1]
     if ext not in ALL_EXTENSIONS:
         return None
+
     return path
 
 def auto_purge_corrupted_files(target_folder):
@@ -159,9 +199,13 @@ def auto_purge_corrupted_files(target_folder):
             path = os.path.join(root, f)
             ext = f.rsplit('.', 1)[-1].lower() if '.' in f else ''
 
-            if ext in MEDIA_EXTENSIONS and ext not in ['json', 'xml', 'txt', 'csv']:
-                try:
-                    size = os.path.getsize(path)
+            try:
+                size = os.path.getsize(path)
+                if size == 0 and f.endswith(".part"):
+                    os.remove(path)
+                    continue
+
+                if ext in MEDIA_EXTENSIONS and ext not in ['json', 'xml', 'txt', 'csv']:
                     if size == 0 or size == 715:
                         os.remove(path)
                         purged += 1
@@ -172,8 +216,8 @@ def auto_purge_corrupted_files(target_folder):
                         if any(sig in header for sig in portal_signatures):
                             os.remove(path)
                             purged += 1
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
     if purged > 0:
         print(f"[+] Self-Healing: Automatically purged {purged} corrupt/captive-portal files for clean re-download.")
@@ -429,6 +473,10 @@ class SugarCubeHandler:
         passages_raw = re.findall(r'<tw-passagedata[^>]*pid="([^"]*)"[^>]*name="([^"]*)"[^>]*>(.*?)</tw-passagedata>', html_content, re.DOTALL)
         if not passages_raw:
             passages_raw = [(str(i+1), n, b) for i, (n, b) in enumerate(re.findall(r'<tw-passagedata[^>]*name="([^"]*)"[^>]*>(.*?)</tw-passagedata>', html_content, re.DOTALL))]
+        if not passages_raw:
+            # Twine 1 / Sugarcane / Jonah / Responsive tiddler support
+            tiddlers = re.findall(r'<div[^>]*tiddler="([^"]*)"[^>]*>(.*?)</div>', html_content, re.DOTALL)
+            passages_raw = [(str(i+1), n, b) for i, (n, b) in enumerate(tiddlers)]
         print(f"[+] Extracted {len(passages_raw)} passages from story data.")
 
         pid_to_name = {pid: name for pid, name, _ in passages_raw}
@@ -439,11 +487,23 @@ class SugarCubeHandler:
         for pid, name, p_text in passages_raw:
             p_unescaped = html.unescape(p_text)
             links = []
-            for l_match in re.finditer(r'\[\[(?:([^|\]]+)\|)?([^\]]+)\]\]', p_unescaped):
-                links.append(l_match.group(2).strip())
+            for l_match in re.finditer(r'\[\[(.*?)\]\]', p_unescaped):
+                link_content = l_match.group(1).strip()
+                if '->' in link_content:
+                    target = link_content.split('->', 1)[1].strip()
+                elif '<-' in link_content:
+                    target = link_content.split('<-', 1)[0].strip()
+                elif '|' in link_content:
+                    target = link_content.split('|', 1)[1].strip()
+                else:
+                    target = link_content
+                if target:
+                    links.append(target)
             for m_link in re.finditer(r'<<(?:link|button)\s+[\'"][^\'"]+[\'"](?:\s+[\'"]([^\'"]+)[\'"])?', p_unescaped):
                 if m_link.group(1):
                     links.append(m_link.group(1).strip())
+            for m_goto in re.finditer(r'<<(?:goto|include|display)\s+[\'"]([^\'"]+)[\'"]', p_unescaped):
+                links.append(m_goto.group(1).strip())
             for m_data in re.finditer(r'data-passage=[\'"]([^\'"]+)[\'"]', p_unescaped):
                 links.append(m_data.group(1).strip())
             story_graph[name] = links
@@ -505,6 +565,9 @@ class SugarCubeHandler:
             # SugarCube [img[...]] syntax
             for raw in re.findall(r'\[img\[(.*?)\]\]', text):
                 for part in raw.split(']['):
+                    part = part.strip()
+                    if '|' in part:
+                        part = part.split('|', 1)[1].strip()
                     c = clean_relative_path(part)
                     if c:
                         if not c.lower().startswith(('images/', 'videos/', 'sounds/', 'audio/')) and '/' not in c:
@@ -513,6 +576,15 @@ class SugarCubeHandler:
                             vids.append(c)
                         else:
                             imgs.append(c)
+
+            # SugarCube macro tags (<<video "path">>, <<audio "path">>)
+            for m in re.finditer(r'<<(?:video|audio)\s+[\'"]([^\'"]+)[\'"]', text, re.I):
+                c = clean_relative_path(m.group(1))
+                if c:
+                    if c.lower().endswith(('.mp4', '.webm', '.avi', '.mov')):
+                        vids.append(c)
+                    else:
+                        imgs.append(c)
 
             # Audio macros
             for m in re.finditer(r'<<cacheaudio\s+[\'"][^\'"]+[\'"]\s+[\'"]([^\'"]+)[\'"]', text):
@@ -580,6 +652,19 @@ class RPGMakerHandler:
             'CommonEvents.json', 'MapInfos.json'
         ]
 
+        # Check for encrypted assets
+        encrypted = False
+        sys_url = urljoin(game_url, "data/System.json")
+        try:
+            r = session.get(sys_url, verify=verify_ssl, timeout=5)
+            if r.status_code == 200:
+                sys_data = r.json()
+                if sys_data.get("hasEncryptedImages") or sys_data.get("hasEncryptedAudio") or "encryptionKey" in sys_data:
+                    encrypted = True
+                    print("  [+] RPG Maker encrypted asset container detected.")
+        except Exception:
+            pass
+
         for df in data_files:
             rel = f"data/{df}"
             assets.add(rel)
@@ -592,12 +677,20 @@ class RPGMakerHandler:
                         name = m.group(1)
                         for sub in ['characters', 'faces', 'pictures', 'sv_actors', 'sv_enemies', 'system', 'tilesets', 'titles1', 'titles2']:
                             assets.add(f"img/{sub}/{name}.png")
+                            if encrypted:
+                                assets.add(f"img/{sub}/{name}.rpgmvp")
+                                assets.add(f"img/{sub}/{name}.png_")
                     for m in re.finditer(r'[\'"]name[\'"]\s*:\s*[\'"]([a-zA-Z0-9_\-]+)[\'"]', text):
                         name = m.group(1)
                         if name:
                             for sub in ['bgm', 'bgs', 'me', 'se']:
                                 assets.add(f"audio/{sub}/{name}.ogg")
                                 assets.add(f"audio/{sub}/{name}.m4a")
+                                if encrypted:
+                                    assets.add(f"audio/{sub}/{name}.rpgmvo")
+                                    assets.add(f"audio/{sub}/{name}.rpgmvm")
+                                    assets.add(f"audio/{sub}/{name}.ogg_")
+                                    assets.add(f"audio/{sub}/{name}.m4a_")
             except Exception:
                 pass
 
@@ -646,6 +739,15 @@ class AssetDownloader:
         if self.stop_requested:
             return False, 0, "limit_reached"
 
+        # Security: Prevent path traversal outside download_folder
+        try:
+            canonical_target = os.path.abspath(self.download_folder)
+            canonical_local = os.path.abspath(local_path)
+            if not canonical_local.startswith(canonical_target + os.sep):
+                return False, 0, "path_traversal_rejected"
+        except Exception:
+            return False, 0, "path_traversal_rejected"
+
         folder = os.path.dirname(local_path)
         if folder:
             os.makedirs(folder, exist_ok=True)
@@ -679,15 +781,17 @@ class AssetDownloader:
         is_media = ext in MEDIA_EXTENSIONS and ext not in ['json', 'xml', 'txt', 'csv']
 
         parsed_url = urlparse(full_url)
-        safe_path = quote(unquote(parsed_url.path))
+        safe_path = quote(unquote(parsed_url.path.replace('+', '%2B')), safe="/()'!~,-_.@")
         safe_request_url = urlunparse((parsed_url.scheme, parsed_url.netloc, safe_path, parsed_url.params, parsed_url.query, parsed_url.fragment))
 
-        for attempt in range(3):
+        for attempt in range(5):
             if self.stop_requested:
                 return False, 0, "limit_reached"
 
             try:
                 headers = {}
+                if self.base_url:
+                    headers["Referer"] = self.base_url
                 if resume_offset > 0:
                     headers["Range"] = f"bytes={resume_offset}-"
 
@@ -704,8 +808,21 @@ class AssetDownloader:
                     return False, 0, "captive_portal_intercept"
 
                 if r.status_code == 206:
+                    expected_total = -1
+                    cr = r.headers.get("Content-Range", "")
+                    if "/" in cr:
+                        try:
+                            cr_total = int(cr.rsplit("/", 1)[1].strip())
+                            if cr_total > 0:
+                                expected_total = cr_total
+                        except Exception:
+                            pass
+                    cl = int(r.headers.get("Content-Length", 0) or 0)
+                    if expected_total <= 0 and cl > 0:
+                        expected_total = resume_offset + cl
+
                     with open(part_path, 'ab') as f:
-                        for chunk in r.iter_content(chunk_size=16384):
+                        for chunk in r.iter_content(chunk_size=65536):
                             if chunk:
                                 f.write(chunk)
                                 downloaded_bytes += len(chunk)
@@ -714,15 +831,22 @@ class AssetDownloader:
                                     if self.max_bytes and self.total_downloaded_bytes >= self.max_bytes:
                                         self.stop_requested = True
                                         break
-                    if not self.stop_requested:
-                        os.replace(part_path, local_path)
-                        return True, downloaded_bytes, "resumed"
-                    else:
+                    if self.stop_requested:
                         return False, downloaded_bytes, "limit_reached"
 
+                    # Verify stream truncation
+                    if expected_total > 0 and os.path.exists(part_path) and os.path.getsize(part_path) < expected_total:
+                        raise IOError(f"Truncated stream ({os.path.getsize(part_path)}/{expected_total})")
+
+                    os.replace(part_path, local_path)
+                    return True, downloaded_bytes, "resumed"
+
                 elif r.status_code == 200:
+                    cl = int(r.headers.get("Content-Length", 0) or 0)
+                    expected_total = cl if cl > 0 else -1
+
                     with open(part_path, 'wb') as f:
-                        for chunk in r.iter_content(chunk_size=16384):
+                        for chunk in r.iter_content(chunk_size=65536):
                             if chunk:
                                 f.write(chunk)
                                 downloaded_bytes += len(chunk)
@@ -731,11 +855,24 @@ class AssetDownloader:
                                     if self.max_bytes and self.total_downloaded_bytes >= self.max_bytes:
                                         self.stop_requested = True
                                         break
-                    if not self.stop_requested:
-                        os.replace(part_path, local_path)
-                        return True, downloaded_bytes, "downloaded"
-                    else:
+                    if self.stop_requested:
                         return False, downloaded_bytes, "limit_reached"
+
+                    # Verify stream truncation
+                    if expected_total > 0 and os.path.exists(part_path) and os.path.getsize(part_path) < expected_total:
+                        raise IOError(f"Truncated stream ({os.path.getsize(part_path)}/{expected_total})")
+
+                    os.replace(part_path, local_path)
+                    return True, downloaded_bytes, "downloaded"
+
+                elif r.status_code == 416:
+                    if os.path.exists(part_path) and os.path.getsize(part_path) > 715:
+                        os.replace(part_path, local_path)
+                        return True, 0, "completed"
+                    elif os.path.exists(part_path):
+                        os.remove(part_path)
+                        resume_offset = 0
+                        continue
 
                 elif r.status_code in [404, 403]:
                     if os.path.exists(part_path):
@@ -825,11 +962,89 @@ class AssetDownloader:
 
         mb_down = self.total_downloaded_bytes / (1024 * 1024)
         print(f"[+] Download session finished: {success_count} ready ({cached_count} already present, {resumed_count} resumed), {failed_count} not found. ({mb_down:.2f} MB transferred)")
+
+        # Post-download disk verification audit
+        verified_count = 0
+        missing_count = 0
+        for rel in asset_map:
+            lp = os.path.join(self.download_folder, rel)
+            if os.path.exists(lp) and os.path.getsize(lp) > 715:
+                verified_count += 1
+            else:
+                missing_count += 1
+
+        audit_msg = f"[AUDIT] Verified on disk: {verified_count}/{total} files intact."
+        if missing_count > 0:
+            audit_msg += f" ({missing_count} files not present on disk)"
+        print(audit_msg)
+
         return success_count, failed_count, (limit_hit or self.stop_requested)
 
 # ==============================================================================
-# ON-DEMAND CACHING SERVER (PLAY-NOW MODE)
+# LOCAL SERVERS & ON-DEMAND PROXY (PLAY-NOW MODE)
 # ==============================================================================
+
+class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header('Accept-Ranges', 'bytes')
+        super().end_headers()
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        rel_path = unquote(parsed.path.replace('+', '%2B')).lstrip('/')
+        if not rel_path:
+            rel_path = 'index.html'
+
+        local_path = os.path.join(os.getcwd(), rel_path)
+        canonical_cwd = os.path.abspath(os.getcwd())
+        canonical_local = os.path.abspath(local_path)
+        if not (canonical_local == canonical_cwd or canonical_local.startswith(canonical_cwd + os.sep)):
+            self.send_error(403, "Access denied")
+            return
+
+        if not os.path.isfile(local_path):
+            return super().do_GET()
+
+        file_size = os.path.getsize(local_path)
+        content_type, _ = mimetypes.guess_type(local_path)
+        if not content_type:
+            content_type = 'application/octet-stream'
+
+        range_header = self.headers.get('Range')
+        if range_header and range_header.startswith('bytes='):
+            try:
+                ranges = range_header[6:].split('-')
+                start = int(ranges[0]) if ranges[0] else 0
+                end = int(ranges[1]) if ranges[1] else file_size - 1
+                if end >= file_size:
+                    end = file_size - 1
+                length = end - start + 1
+
+                self.send_response(206)
+                self.send_header('Content-Type', content_type)
+                self.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
+                self.send_header('Content-Length', str(length))
+                self.send_header('Accept-Ranges', 'bytes')
+                self.end_headers()
+
+                with open(local_path, 'rb') as f:
+                    f.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        chunk = f.read(min(remaining, 65536))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                return
+            except Exception:
+                pass
+
+        return super().do_GET()
 
 class OnDemandCachingServer:
     """
@@ -838,6 +1053,8 @@ class OnDemandCachingServer:
     """
     @staticmethod
     def create_handler(target_folder, game_url, session, verify_ssl):
+        canonical_target = os.path.abspath(target_folder)
+
         class Handler(http.server.SimpleHTTPRequestHandler):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, directory=target_folder, **kwargs)
@@ -850,7 +1067,12 @@ class OnDemandCachingServer:
                     self.send_error(404, "File not found")
                     return
 
-                file_size = os.path.getsize(local_path)
+                try:
+                    file_size = os.path.getsize(local_path)
+                except OSError:
+                    self.send_error(404, "File not accessible")
+                    return
+
                 content_type, _ = mimetypes.guess_type(local_path)
                 if not content_type:
                     content_type = "application/octet-stream"
@@ -891,39 +1113,66 @@ class OnDemandCachingServer:
                 self.send_header("Accept-Ranges", "bytes")
                 self.end_headers()
 
-                with open(local_path, "rb") as f:
-                    while True:
-                        chunk = f.read(65536)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
+                try:
+                    with open(local_path, "rb") as f:
+                        while True:
+                            chunk = f.read(65536)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                except Exception:
+                    pass
 
             def do_GET(self):
                 parsed = urlparse(self.path)
-                rel_path = unquote(parsed.path.lstrip('/'))
+                rel_path = unquote(parsed.path.replace('+', '%2B')).lstrip('/')
 
                 if not rel_path or rel_path == "index.html":
                     return self.serve_local_file(os.path.join(target_folder, "index.html"))
 
                 local_path = os.path.join(target_folder, rel_path)
 
+                # Security: Canonical path traversal check
+                try:
+                    canonical_local = os.path.abspath(local_path)
+                    if not (canonical_local == canonical_target or canonical_local.startswith(canonical_target + os.sep)):
+                        self.send_error(403, "Access denied")
+                        return
+                except Exception:
+                    self.send_error(403, "Access denied")
+                    return
+
                 # 1. Serve directly if valid and complete
                 if os.path.exists(local_path) and os.path.getsize(local_path) > 715:
                     return self.serve_local_file(local_path)
 
                 # 2. On-demand fetch from remote CDN
-                safe_rel = quote(unquote(rel_path))
+                safe_rel = quote(unquote(rel_path.replace('+', '%2B')), safe="/()'!~,-_.@")
                 full_url = urljoin(game_url, safe_rel)
                 try:
-                    r = session.get(full_url, verify=verify_ssl, stream=True, timeout=25)
+                    headers = {"Referer": game_url} if game_url else {}
+                    r = session.get(full_url, headers=headers, verify=verify_ssl, stream=True, timeout=25)
                     content_type = r.headers.get("Content-Type", "").lower()
                     if r.status_code == 200 and "text/html" not in content_type:
                         os.makedirs(os.path.dirname(local_path), exist_ok=True)
                         part_path = local_path + ".part"
+                        cl = int(r.headers.get("Content-Length", 0) or 0)
+                        expected_total = cl if cl > 0 else -1
+
                         with open(part_path, "wb") as f:
-                            for chunk in r.iter_content(chunk_size=32768):
+                            for chunk in r.iter_content(chunk_size=65536):
                                 if chunk:
                                     f.write(chunk)
+
+                        # Truncation verification
+                        if expected_total > 0 and os.path.exists(part_path) and os.path.getsize(part_path) < expected_total:
+                            try:
+                                os.remove(part_path)
+                            except Exception:
+                                pass
+                            self.send_error(502, f"Incomplete transfer from CDN for {rel_path}")
+                            return
+
                         os.replace(part_path, local_path)
                         return self.serve_local_file(local_path)
                 except Exception:
@@ -1191,6 +1440,7 @@ import mimetypes
 import http.server
 import socketserver
 import webbrowser
+from urllib.parse import urlparse, unquote
 
 class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
     def end_headers(self):
@@ -1198,10 +1448,18 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_GET(self):
-        rel_path = self.path.split('?')[0].split('#')[0].lstrip('/')
+        parsed = urlparse(self.path)
+        rel_path = unquote(parsed.path.replace('+', '%2B')).lstrip('/')
         if not rel_path:
             rel_path = 'index.html'
+
         local_path = os.path.join(os.getcwd(), rel_path)
+        canonical_cwd = os.path.abspath(os.getcwd())
+        canonical_local = os.path.abspath(local_path)
+        if not (canonical_local == canonical_cwd or canonical_local.startswith(canonical_cwd + os.sep)):
+            self.send_error(403, "Access denied")
+            return
+
         if not os.path.isfile(local_path):
             return super().do_GET()
 
@@ -1284,7 +1542,7 @@ except KeyboardInterrupt:
     for rel_path in discovered_assets:
         if no_videos and rel_path.lower().endswith(video_exts):
             continue
-        safe_rel = quote(unquote(rel_path))
+        safe_rel = quote(unquote(rel_path.replace('+', '%2B')), safe="/()'!~,-_.@")
         full_url = urljoin(game_url, safe_rel)
         asset_map[rel_path] = full_url
 
@@ -1298,7 +1556,18 @@ except KeyboardInterrupt:
     if play_now:
         port = 8080
         handler_cls = OnDemandCachingServer.create_handler(target_folder, game_url, session, verify_ssl)
-        httpd = socketserver.TCPServer(("", port), handler_cls)
+        for p in range(8080, 8100):
+            try:
+                httpd = ThreadingTCPServer(("", p), handler_cls)
+                port = p
+                break
+            except OSError:
+                continue
+
+        if not httpd:
+            print("[!] Could not bind to any port between 8080 and 8100.")
+            return
+
         server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         server_thread.start()
         print("\n" + "=" * 75)
@@ -1365,10 +1634,24 @@ except KeyboardInterrupt:
             print("\n[*] Stopping game server...")
             httpd.shutdown()
     elif serve:
-        print("[*] Launching game locally at http://localhost:8080/index.html ...")
-        webbrowser.open("http://localhost:8080/index.html")
         os.chdir(target_folder)
-        http.server.test(http.server.SimpleHTTPRequestHandler, port=8080)
+        port = 8080
+        serve_httpd = None
+        for p in range(8080, 8100):
+            try:
+                serve_httpd = ThreadingTCPServer(("", p), RangeRequestHandler)
+                port = p
+                break
+            except OSError:
+                continue
+        if serve_httpd:
+            print(f"[*] Launching game locally at http://localhost:{port}/index.html ...")
+            webbrowser.open(f"http://localhost:{port}/index.html")
+            try:
+                serve_httpd.serve_forever()
+            except KeyboardInterrupt:
+                print("\n[*] Stopping server...")
+                serve_httpd.shutdown()
 
 # ==============================================================================
 # CLI INTERFACE WITH CUSTOM FORMATTED HELP
