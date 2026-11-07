@@ -2681,7 +2681,7 @@ Examples:
 
     parser.add_argument("url", nargs="?", default=None, help="Target URL (Game portal page URL or direct game iframe/CDN URL) or local downloaded game directory")
     parser.add_argument("--update", "--check-updates", "--check-update", dest="update", action="store_true", help="Check for game updates via CDN headers, ETags, and version probing. Scans all games if no URL is given, or checks a specific game.")
-    parser.add_argument("--updateall", "--update-all", dest="updateall", nargs="?", const="downloads", default=None, metavar="DIR", help="Recursively discovers and checks all game installations inside DIR (defaults to 'downloads/').")
+    parser.add_argument("--updateall", dest="updateall", nargs="?", const="downloads", default=None, metavar="DIR", help="Recursively discovers and checks all game installations inside DIR (defaults to 'downloads/').")
     parser.add_argument("-y", "--yes", dest="auto_yes", action="store_true", help="Automatically accept update prompts and download detected updates without confirmation.")
     parser.add_argument("--diff", "--differential", action="store_true", help="Perform differential update check on existing assets (re-verifies remote sizes/hashes and re-downloads modified files).")
     parser.add_argument("-o", "--folder", "--out", dest="folder", type=str, metavar="NAME", help="Custom output directory name (default: auto-named 'downloads/<engine_type>/<Game_Name>-<Version>')")
