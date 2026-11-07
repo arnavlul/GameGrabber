@@ -15,6 +15,7 @@ import time
 import json
 import html
 import shutil
+import hashlib
 import argparse
 import mimetypes
 import urllib3
@@ -270,6 +271,188 @@ def auto_purge_corrupted_files(target_folder):
     if purged > 0:
         print(f"[+] Self-Healing: Automatically purged {purged} corrupt/captive-portal files for clean re-download.")
     return purged
+
+def file_md5(file_path, chunk_size=65536):
+    """Computes the MD5 hex digest of a local file."""
+    try:
+        h = hashlib.md5()
+        with open(file_path, "rb") as f:
+            while chunk := f.read(chunk_size):
+                h.update(chunk)
+        return h.hexdigest().lower()
+    except Exception:
+        return None
+
+def build_size_index(folder):
+    """
+    Builds a dictionary mapping file size in bytes to a list of local file paths.
+    Only indexes files > 10KB to avoid collisions on trivial small files.
+    """
+    size_index = {}
+    if not folder or not os.path.isdir(folder):
+        return size_index
+    skip_files = {"index.html", "game_meta.json", "run_game.bat", "run_game.py"}
+    for root, dirs, files in os.walk(folder):
+        for f in files:
+            if f in skip_files or f.endswith(".part"):
+                continue
+            p = os.path.join(root, f)
+            try:
+                sz = os.path.getsize(p)
+                if sz > 10240:
+                    if sz not in size_index:
+                        size_index[sz] = []
+                    size_index[sz].append(p)
+            except Exception:
+                pass
+    return size_index
+
+def seed_existing_assets(source_folder, dest_folder):
+    """
+    Seeds dest_folder with media assets from source_folder using hardlinks (or fast copy fallback).
+    Excludes entry points, launchers, and metadata so fresh ones are generated.
+    Returns:
+        seeded_count (int): number of seeded files
+        size_index (dict): mapping from file_size -> [local_abs_path, ...] for fast rename detection
+    """
+    if not source_folder or not os.path.isdir(source_folder) or os.path.abspath(source_folder) == os.path.abspath(dest_folder):
+        return 0, {}
+
+    os.makedirs(dest_folder, exist_ok=True)
+    seeded_count = 0
+    size_index = {}
+    skip_files = {"index.html", "game_meta.json", "run_game.bat", "run_game.py"}
+
+    for root, dirs, files in os.walk(source_folder):
+        for f in files:
+            if f in skip_files or f.endswith(".part"):
+                continue
+            src_path = os.path.join(root, f)
+            rel_path = os.path.relpath(src_path, source_folder)
+            dst_path = os.path.join(dest_folder, rel_path)
+
+            if not os.path.exists(dst_path):
+                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                try:
+                    os.link(src_path, dst_path)
+                except Exception:
+                    try:
+                        shutil.copy2(src_path, dst_path)
+                    except Exception:
+                        continue
+                seeded_count += 1
+
+            if os.path.exists(dst_path):
+                try:
+                    sz = os.path.getsize(dst_path)
+                    if sz > 10240:
+                        if sz not in size_index:
+                            size_index[sz] = []
+                        size_index[sz].append(dst_path)
+                except Exception:
+                    pass
+
+    return seeded_count, size_index
+
+def find_existing_game_folder(clean_title, current_target_folder, base_dir="downloads"):
+    """
+    Finds an existing downloaded folder for clean_title to seed from.
+    Searches downloads/html, downloads/renpy, and downloads root. Excludes current_target_folder.
+    """
+    candidates = []
+    norm_title = re.sub(r'[^a-zA-Z0-9]', '', clean_title).lower()
+    abs_target = os.path.abspath(current_target_folder) if current_target_folder else ""
+
+    search_roots = [
+        os.path.join(base_dir, "html"),
+        os.path.join(base_dir, "renpy"),
+        base_dir
+    ]
+
+    for s_root in search_roots:
+        if not os.path.isdir(s_root):
+            continue
+        try:
+            for entry in os.listdir(s_root):
+                full_p = os.path.join(s_root, entry)
+                if not os.path.isdir(full_p) or os.path.abspath(full_p) == abs_target:
+                    continue
+                if entry in ["html", "renpy", "temp"]:
+                    continue
+
+                norm_entry = re.sub(r'[^a-zA-Z0-9]', '', entry).lower()
+                is_match = False
+                if norm_entry.startswith(norm_title):
+                    is_match = True
+
+                meta_p = os.path.join(full_p, "game_meta.json")
+                if not is_match and os.path.exists(meta_p):
+                    try:
+                        with open(meta_p, "r", encoding="utf-8") as f:
+                            m = json.load(f)
+                            m_name = m.get("game_name", "")
+                            if re.sub(r'[^a-zA-Z0-9]', '', m_name).lower() == norm_title:
+                                is_match = True
+                    except Exception:
+                        pass
+
+                if is_match and GameUpdateChecker.is_game_directory(full_p):
+                    candidates.append(full_p)
+        except Exception:
+            pass
+
+    if not candidates:
+        return None
+
+    candidates = list(set(candidates))
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return candidates[0]
+
+def get_remote_file_info(session, url, referer=None, verify_ssl=True):
+    """
+    Queries remote asset metadata (status_code, content_length, etag, last_modified)
+    using HTTP HEAD with fallback to GET Range bytes=0-0.
+    """
+    headers = {"Referer": referer} if referer else {}
+    parsed_url = urlparse(url)
+    safe_path = quote(unquote(parsed_url.path.replace('+', '%2B')), safe="/()'!~,-_.@")
+    safe_url = urlunparse((parsed_url.scheme, parsed_url.netloc, safe_path, parsed_url.params, parsed_url.query, parsed_url.fragment))
+
+    try:
+        r = session.head(safe_url, headers=headers, verify=verify_ssl, timeout=8, allow_redirects=True)
+        if r.status_code in [200, 206]:
+            cl = int(r.headers.get("Content-Length", 0) or 0)
+            etag = r.headers.get("ETag", "").strip('"')
+            lm = r.headers.get("Last-Modified")
+            return r.status_code, cl, etag, lm
+        elif r.status_code in [404, 403]:
+            return r.status_code, 0, None, None
+    except Exception:
+        pass
+
+    try:
+        h = dict(headers)
+        h["Range"] = "bytes=0-0"
+        r = session.get(safe_url, headers=h, verify=verify_ssl, timeout=8, stream=True)
+        if r.status_code == 206:
+            cr = r.headers.get("Content-Range", "")
+            cl = 0
+            if "/" in cr:
+                try:
+                    cl = int(cr.rsplit("/", 1)[1].strip())
+                except Exception:
+                    pass
+            etag = r.headers.get("ETag", "").strip('"')
+            lm = r.headers.get("Last-Modified")
+            return 200, cl, etag, lm
+        elif r.status_code == 200:
+            cl = int(r.headers.get("Content-Length", 0) or 0)
+            etag = r.headers.get("ETag", "").strip('"')
+            lm = r.headers.get("Last-Modified")
+            return 200, cl, etag, lm
+        return r.status_code, 0, None, None
+    except Exception:
+        return 0, 0, None, None
 
 # ==============================================================================
 # IFRAME & GAME URL EXTRACTOR
@@ -807,9 +990,9 @@ class ConstructHandler:
 # ==============================================================================
 
 class AssetDownloader:
-    """Downloads files with streaming, multi-threading, Range-resuming, data-limit caps, and atomic .part renaming."""
+    """Downloads files with streaming, multi-threading, Range-resuming, data-limit caps, atomic .part renaming, differential updates, and rename reuse."""
 
-    def __init__(self, base_url, download_folder, session, verify_ssl=True, max_workers=8, max_mb=None):
+    def __init__(self, base_url, download_folder, session, verify_ssl=True, max_workers=8, max_mb=None, diff_check=False, size_index=None):
         self.base_url = base_url
         self.download_folder = download_folder
         self.session = session
@@ -820,6 +1003,12 @@ class AssetDownloader:
         self.total_downloaded_bytes = 0
         self.stop_requested = False
         self._lock = threading.Lock()
+        self.diff_check = diff_check
+        self.size_index = size_index if size_index is not None else {}
+        self.cached_count = 0
+        self.reused_count = 0
+        self.updated_count = 0
+        self.downloaded_count = 0
 
     def download_file(self, full_url, local_path):
         if self.stop_requested:
@@ -838,7 +1027,9 @@ class AssetDownloader:
         if folder:
             os.makedirs(folder, exist_ok=True)
 
-        # 1. Skip if already completed (and not a fake captive-portal block)
+        is_modified = False
+
+        # 1. Existing local file handling
         if os.path.exists(local_path):
             size = os.path.getsize(local_path)
             if size == 715 or size == 0:
@@ -846,8 +1037,74 @@ class AssetDownloader:
                     os.remove(local_path)
                 except Exception:
                     pass
+            elif self.diff_check:
+                status_code, remote_len, remote_etag, remote_lm = get_remote_file_info(
+                    self.session, full_url, referer=self.base_url, verify_ssl=self.verify_ssl
+                )
+                if status_code in [200, 206]:
+                    if remote_len > 0 and remote_len != size:
+                        is_modified = True
+                        try:
+                            os.remove(local_path)
+                        except Exception:
+                            pass
+                    elif remote_etag and len(remote_etag) == 32 and size < 10 * 1024 * 1024:
+                        local_md5 = file_md5(local_path)
+                        if local_md5 and local_md5 != remote_etag.lower():
+                            is_modified = True
+                            try:
+                                os.remove(local_path)
+                            except Exception:
+                                pass
+                        else:
+                            with self._lock:
+                                self.cached_count += 1
+                            return True, 0, "cached"
+                    else:
+                        with self._lock:
+                            self.cached_count += 1
+                        return True, 0, "cached"
+                elif status_code in [404, 403]:
+                    return False, 0, f"http_{status_code}"
+                else:
+                    with self._lock:
+                        self.cached_count += 1
+                    return True, 0, "cached"
             else:
+                with self._lock:
+                    self.cached_count += 1
                 return True, 0, "cached"
+
+        # 2. Rename detection: if file does not exist locally, check if identical content exists under another name
+        if not os.path.exists(local_path) and self.size_index and not is_modified:
+            status_code, remote_len, remote_etag, remote_lm = get_remote_file_info(
+                self.session, full_url, referer=self.base_url, verify_ssl=self.verify_ssl
+            )
+            if status_code in [200, 206] and remote_len > 10240 and remote_len in self.size_index:
+                cand_paths = self.size_index[remote_len]
+                for cand_path in cand_paths:
+                    if os.path.exists(cand_path) and os.path.getsize(cand_path) == remote_len:
+                        try:
+                            with open(cand_path, 'rb') as cf:
+                                cand_prefix = cf.read(8192)
+                            parsed_u = urlparse(full_url)
+                            sp = quote(unquote(parsed_u.path.replace('+', '%2B')), safe="/()'!~,-_.@")
+                            su = urlunparse((parsed_u.scheme, parsed_u.netloc, sp, parsed_u.params, parsed_u.query, parsed_u.fragment))
+                            rh = {"Range": "bytes=0-8191"}
+                            if self.base_url:
+                                rh["Referer"] = self.base_url
+                            rr = self.session.get(su, headers=rh, verify=self.verify_ssl, timeout=8)
+                            if rr.status_code in [200, 206] and len(rr.content) > 0 and rr.content[:len(cand_prefix)] == cand_prefix:
+                                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                                try:
+                                    os.link(cand_path, local_path)
+                                except Exception:
+                                    shutil.copy2(cand_path, local_path)
+                                with self._lock:
+                                    self.reused_count += 1
+                                return True, 0, "reused_rename"
+                        except Exception:
+                            pass
 
         if self.max_bytes:
             with self._lock:
@@ -855,7 +1112,7 @@ class AssetDownloader:
                     self.stop_requested = True
                     return False, 0, "limit_reached"
 
-        # 2. Use .part file for atomic download and safe resuming
+        # 3. Use .part file for atomic download and safe resuming
         part_path = local_path + ".part"
         downloaded_bytes = 0
         resume_offset = 0
@@ -883,7 +1140,6 @@ class AssetDownloader:
 
                 r = self.session.get(safe_request_url, headers=headers, verify=self.verify_ssl, stream=True, timeout=25)
 
-                # Guard against captive portal intercepts
                 content_type = r.headers.get("Content-Type", "").lower()
                 if is_media and "text/html" in content_type:
                     if os.path.exists(part_path):
@@ -920,12 +1176,15 @@ class AssetDownloader:
                     if self.stop_requested:
                         return False, downloaded_bytes, "limit_reached"
 
-                    # Verify stream truncation
                     if expected_total > 0 and os.path.exists(part_path) and os.path.getsize(part_path) < expected_total:
                         raise IOError(f"Truncated stream ({os.path.getsize(part_path)}/{expected_total})")
 
                     os.replace(part_path, local_path)
-                    return True, downloaded_bytes, "resumed"
+                    status_name = "updated" if is_modified else "resumed"
+                    with self._lock:
+                        if is_modified:
+                            self.updated_count += 1
+                    return True, downloaded_bytes, status_name
 
                 elif r.status_code == 200:
                     cl = int(r.headers.get("Content-Length", 0) or 0)
@@ -944,17 +1203,26 @@ class AssetDownloader:
                     if self.stop_requested:
                         return False, downloaded_bytes, "limit_reached"
 
-                    # Verify stream truncation
                     if expected_total > 0 and os.path.exists(part_path) and os.path.getsize(part_path) < expected_total:
                         raise IOError(f"Truncated stream ({os.path.getsize(part_path)}/{expected_total})")
 
                     os.replace(part_path, local_path)
-                    return True, downloaded_bytes, "downloaded"
+                    status_name = "updated" if is_modified else "downloaded"
+                    with self._lock:
+                        if is_modified:
+                            self.updated_count += 1
+                        else:
+                            self.downloaded_count += 1
+                    return True, downloaded_bytes, status_name
 
                 elif r.status_code == 416:
                     if os.path.exists(part_path) and os.path.getsize(part_path) > 715:
                         os.replace(part_path, local_path)
-                        return True, 0, "completed"
+                        status_name = "updated" if is_modified else "completed"
+                        with self._lock:
+                            if is_modified:
+                                self.updated_count += 1
+                        return True, 0, status_name
                     elif os.path.exists(part_path):
                         os.remove(part_path)
                         resume_offset = 0
@@ -976,7 +1244,6 @@ class AssetDownloader:
     def download_batch(self, asset_map):
         success_count = 0
         failed_count = 0
-        cached_count = 0
         resumed_count = 0
         total = len(asset_map)
         limit_hit = False
@@ -984,7 +1251,6 @@ class AssetDownloader:
         limit_info = f" (Max download limit: {self.max_mb:.1f} MB)" if self.max_mb else ""
         print(f"[*] Starting download of {total} assets with {self.max_workers} worker threads{limit_info}...")
 
-        # Prioritize files that have existing .part chunks so interrupted downloads finish first
         sorted_items = sorted(
             asset_map.items(),
             key=lambda item: 0 if os.path.exists(os.path.join(self.download_folder, item[0]) + ".part") else 1
@@ -993,7 +1259,6 @@ class AssetDownloader:
         active_futures = {}
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Prime the pool with initial tasks
             for _ in range(self.max_workers * 2):
                 try:
                     rel_path, url = next(items_iter)
@@ -1005,7 +1270,7 @@ class AssetDownloader:
             with tqdm(
                 total=total,
                 unit="file",
-                desc="Downloading Game Assets",
+                desc="Processing Game Assets",
                 bar_format="{desc}: {percentage:3.0f}%|{bar}| {n}/{total} files [{elapsed}<{remaining}, {rate_fmt}, {postfix}]"
             ) as pbar:
                 while active_futures:
@@ -1018,9 +1283,7 @@ class AssetDownloader:
                                 limit_hit = True
                             elif ok:
                                 success_count += 1
-                                if status == "cached":
-                                    cached_count += 1
-                                elif status == "resumed":
+                                if status == "resumed":
                                     resumed_count += 1
                             else:
                                 failed_count += 1
@@ -1029,20 +1292,24 @@ class AssetDownloader:
 
                         mb_down = self.total_downloaded_bytes / (1024 * 1024)
                         if self.max_mb:
-                            status_text = f"{mb_down:.1f}/{self.max_mb:.0f} MB"
+                            status_parts = [f"{mb_down:.1f}/{self.max_mb:.0f} MB"]
                         else:
-                            status_text = f"{mb_down:.1f} MB"
+                            status_parts = [f"{mb_down:.1f} MB"]
 
-                        if cached_count:
-                            status_text += f", {cached_count} cached"
-                        if resumed_count:
-                            status_text += f", {resumed_count} resumed"
+                        if self.cached_count:
+                            status_parts.append(f"{self.cached_count} cached")
+                        if self.reused_count:
+                            status_parts.append(f"{self.reused_count} reused")
+                        if self.updated_count:
+                            status_parts.append(f"{self.updated_count} updated")
+                        if self.downloaded_count:
+                            status_parts.append(f"{self.downloaded_count} new")
                         if failed_count:
-                            status_text += f", {failed_count} skipped"
-                        pbar.set_postfix_str(status_text)
+                            status_parts.append(f"{failed_count} skipped")
+
+                        pbar.set_postfix_str(", ".join(status_parts))
                         pbar.update(1)
 
-                        # Submit next task if limit has not been hit
                         if not self.stop_requested:
                             try:
                                 nxt_rel, nxt_url = next(items_iter)
@@ -1052,7 +1319,19 @@ class AssetDownloader:
                                 pass
 
         mb_down = self.total_downloaded_bytes / (1024 * 1024)
-        print(f"[+] Download session finished: {success_count} ready ({cached_count} already present, {resumed_count} resumed), {failed_count} not found. ({mb_down:.2f} MB transferred)")
+        print("\n" + "=" * 75)
+        print(" [+] Asset Transfer & Update Summary:")
+        print(f"     * Total Assets Processed : {total}")
+        print(f"     * Unchanged / Cached     : {self.cached_count}")
+        if self.reused_count:
+            print(f"     * Reused (Name Changes)  : {self.reused_count}")
+        if self.updated_count:
+            print(f"     * Modified / Updated     : {self.updated_count}")
+        print(f"     * Newly Downloaded       : {self.downloaded_count}")
+        if failed_count:
+            print(f"     * Skipped / 404 Missing  : {failed_count}")
+        print(f"     * Total Data Transferred : {mb_down:.2f} MB")
+        print("=" * 75 + "\n")
 
         # Post-download disk verification audit
         verified_count = 0
@@ -1065,6 +1344,11 @@ class AssetDownloader:
                 missing_count += 1
 
         audit_msg = f"[AUDIT] Verified on disk: {verified_count}/{total} files intact."
+        if missing_count > 0:
+            audit_msg += f" ({missing_count} files not present on disk)"
+        print(audit_msg)
+
+        return success_count, failed_count, (limit_hit or self.stop_requested)
         if missing_count > 0:
             audit_msg += f" ({missing_count} files not present on disk)"
         print(audit_msg)
@@ -1585,7 +1869,7 @@ class GameUpdateChecker:
 # MAIN GAME GRABBER ORCHESTRATOR
 # ==============================================================================
 
-def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=8, serve=False, play_now=False, max_workers=8, proxy=None, no_videos=False, stream_only=False, limit_mb=None):
+def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=8, serve=False, play_now=False, max_workers=8, proxy=None, no_videos=False, stream_only=False, limit_mb=None, diff_check=False, seed_folder=None):
     verify_ssl = not no_verify
     url = normalize_url(url)
 
@@ -1719,6 +2003,7 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
 
     meta_path = os.path.join(target_folder, "game_meta.json")
 
+    detected_prior_folder = None
     if os.path.exists(meta_path):
         try:
             with open(meta_path, "r", encoding="utf-8") as f:
@@ -1733,12 +2018,27 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
                 new_folder = os.path.join(category_dir, f"{clean_title}-{detected_version}")
                 print(f"[*] Resuming in separate folder '{new_folder}' to prevent data corruption!")
                 print("=" * 75 + "\n")
+                detected_prior_folder = target_folder
                 target_folder = new_folder
                 meta_path = os.path.join(target_folder, "game_meta.json")
             else:
                 print(f"[+] Found existing '{prev_version}' download in '{target_folder}'. Resuming missing assets...")
         except Exception:
             pass
+
+    # Look for an existing version folder to seed from if not supplied
+    if not seed_folder:
+        seed_folder = detected_prior_folder or find_existing_game_folder(clean_title, target_folder, base_dir=base_download_dir)
+
+    size_index = {}
+    if seed_folder and os.path.abspath(seed_folder) != os.path.abspath(target_folder):
+        print(f"[*] Previous version detected at: {seed_folder}")
+        print(f"[*] Seeding assets into '{target_folder}' via hardlinks for instant differential update...")
+        seeded_count, size_index = seed_existing_assets(seed_folder, target_folder)
+        print(f"[+] Fast-seeded {seeded_count} assets from previous version (0 extra disk space).")
+        diff_check = True
+    elif os.path.exists(target_folder):
+        size_index = build_size_index(target_folder)
 
     os.makedirs(target_folder, exist_ok=True)
     print(f"[+] Output Directory: {os.path.abspath(target_folder)}")
@@ -2108,7 +2408,9 @@ if __name__ == "__main__":
         session=session,
         verify_ssl=verify_ssl,
         max_workers=max_workers,
-        max_mb=limit_mb
+        max_mb=limit_mb,
+        diff_check=diff_check,
+        size_index=size_index
     )
     success_count, failed_count, limit_reached = downloader.download_batch(asset_map)
 
@@ -2222,6 +2524,9 @@ Examples:
   python scraper.py "Seven_Sins-v1.10" --update -y
   python scraper.py "https://gamcore.com/games/seven_sins" --update
 
+  # Force differential verification / check on existing assets:
+  python scraper.py "Seven_Sins-v1.10" --diff
+
   # Stop after 250 MB downloaded (safe for limited data plans, resumable anytime):
   python scraper.py "https://game-portal.com/games/space-adventure" --limit 250
 
@@ -2235,6 +2540,7 @@ Examples:
     parser.add_argument("--update", "--check-updates", "--check-update", dest="update", action="store_true", help="Check for game updates via CDN headers, ETags, and version probing. Scans all games if no URL is given, or checks a specific game.")
     parser.add_argument("--updateall", "--update-all", dest="updateall", nargs="?", const="downloads", default=None, metavar="DIR", help="Recursively discovers and checks all game installations inside DIR (defaults to 'downloads/').")
     parser.add_argument("-y", "--yes", dest="auto_yes", action="store_true", help="Automatically accept update prompts and download detected updates without confirmation.")
+    parser.add_argument("--diff", "--differential", action="store_true", help="Perform differential update check on existing assets (re-verifies remote sizes/hashes and re-downloads modified files).")
     parser.add_argument("-o", "--folder", "--out", dest="folder", type=str, metavar="NAME", help="Custom output directory name (default: auto-named 'downloads/<engine_type>/<Game_Name>-<Version>')")
     parser.add_argument("--play-now", "--stream", dest="play_now", action="store_true", help="Play immediately! Starts an on-demand caching server and streams missing assets live while downloading in background")
     parser.add_argument("--stream-only", "--lazy", dest="stream_only", action="store_true", help="Conserve bandwidth: launches game server and streams assets ONLY on-demand as you play (disables background pre-downloading)")
@@ -2297,7 +2603,9 @@ Examples:
                         proxy=args.proxy,
                         no_videos=args.no_videos,
                         stream_only=args.stream_only,
-                        limit_mb=args.limit
+                        limit_mb=args.limit,
+                        diff_check=True,
+                        seed_folder=g["path"]
                     )
         return
 
@@ -2385,7 +2693,9 @@ Examples:
                     proxy=args.proxy,
                     no_videos=args.no_videos,
                     stream_only=args.stream_only,
-                    limit_mb=args.limit
+                    limit_mb=args.limit,
+                    diff_check=True,
+                    seed_folder=local_path
                 )
         else:
             print("\n" + "-" * 80)
@@ -2409,7 +2719,8 @@ Examples:
         proxy=args.proxy,
         no_videos=args.no_videos,
         stream_only=args.stream_only,
-        limit_mb=args.limit
+        limit_mb=args.limit,
+        diff_check=args.diff
     )
 
 if __name__ == "__main__":

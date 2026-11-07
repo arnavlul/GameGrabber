@@ -20,7 +20,8 @@ Universal browser game downloader and offline player. Download, archive, and pre
   - `--limit <MB>`: Caps total transferred data to a specific quota; safe for limited mobile hotspots or Wi-Fi.
   - `--no-videos`: Downloads all story dialogue, audio, and images while skipping large video files.
 - **Instant Offline Runners:** Automatically writes `run_game.bat` and `run_game.py` (an RFC 7233 compliant multithreaded Range server) into the output directory for smooth seeking and playback.
-- **Lightweight Update Detection (`--update`):** Check for newer versions and game patches in seconds using lightweight HTTP HEAD requests, ETag comparisons, Last-Modified timestamps, and intelligent CDN version probing without downloading heavy media files.
+- **Lightweight Update Detection (`--update` & `--updateall`):** Check for newer versions and game patches in seconds using lightweight HTTP HEAD requests, ETag comparisons, Last-Modified timestamps, and intelligent CDN version probing without downloading heavy media files.
+- **Differential / Delta Updates & Rename Reuse (`--diff`):** When updating an existing game or version, GameGrabber instantly seeds existing media files via hardlinks (zero additional disk space). It verifies remote asset sizes and ETags, downloading *only* genuinely new or modified assets. If an asset was renamed or relocated by the developer, GameGrabber automatically matches file sizes and signatures to reuse the local asset without re-downloading.
 
 ---
 
@@ -105,12 +106,18 @@ python scraper.py "Seven_Sins-v1.10" --update -y
 python scraper.py "https://gamcore.com/games/seven_sins" --update
 ```
 
+### 6. Differential Updates & Asset Verification (`--diff`)
+Updates automatically seed existing assets and only download the delta. You can also explicitly trigger differential verification on any existing directory:
+```bash
+python scraper.py "Seven_Sins-v1.10" --diff
+```
+
 ---
 
 ## 📖 CLI Reference (`--help`)
 
 ```text
-usage: scraper.py [-h] [--update] [--updateall [DIR]] [-y] [-o NAME]
+usage: scraper.py [-h] [--update] [--updateall [DIR]] [-y] [--diff] [-o NAME]
                   [--play-now] [--stream-only] [--no-videos] [--headed]
                   [--no-verify] [--wait SEC] [--threads N] [--serve]
                   [--limit MB] [--proxy URL]
@@ -128,6 +135,9 @@ options:
                         (defaults to 'downloads/')
   -y, --yes             Automatically accept update prompts and download detected updates
                         without confirmation
+  --diff, --differential
+                        Perform differential update check on existing assets (re-verifies
+                        remote sizes/hashes and re-downloads modified files)
   -o, --folder, --out NAME
                         Custom output directory name (default: auto-named 'downloads/<engine_type>/<Game_Name>-<Version>')
   --play-now, --stream  Play immediately! Starts an on-demand caching server and streams
