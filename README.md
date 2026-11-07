@@ -80,14 +80,28 @@ python scraper.py "https://game-portal.com/games/space-adventure" --no-videos
 python scraper.py "https://game-host.com/game/index.html" -o "MyGame" --threads 12
 ```
 
-### 5. Check for Updates (`--update`)
-Scan your entire downloaded library for newly released versions or CDN build changes in seconds:
+### 5. Check for Updates (`--update` & `--updateall`)
+Recursively scan directories (defaults to `downloads/`) for newly released versions or CDN build changes, with interactive `[y/N]` confirmation:
 ```bash
-python scraper.py --update
+# Scan all games in downloads/ and prompt before downloading updates:
+python scraper.py --updateall
+
+# Scan a specific directory tree:
+python scraper.py --updateall "downloads/html"
+
+# Scan and automatically download any detected updates without prompting:
+python scraper.py --updateall -y
 ```
+
 Check a specific downloaded installation or remote game URL:
 ```bash
-python scraper.py "downloads/html/Seven_Sins-v1.10" --update
+# Checks if an update exists and asks [y/N] before downloading:
+python scraper.py "Seven_Sins-v1.10" --update
+
+# Automatically download if an update is found:
+python scraper.py "Seven_Sins-v1.10" --update -y
+
+# Check directly via remote URL:
 python scraper.py "https://gamcore.com/games/seven_sins" --update
 ```
 
@@ -96,9 +110,10 @@ python scraper.py "https://gamcore.com/games/seven_sins" --update
 ## 📖 CLI Reference (`--help`)
 
 ```text
-usage: scraper.py [-h] [-o NAME] [--play-now] [--stream-only] [--no-videos]
-                  [--headed] [--no-verify] [--wait SEC] [--threads N]
-                  [--serve] [--limit MB] [--proxy URL] [--update]
+usage: scraper.py [-h] [--update] [--updateall [DIR]] [-y] [-o NAME]
+                  [--play-now] [--stream-only] [--no-videos] [--headed]
+                  [--no-verify] [--wait SEC] [--threads N] [--serve]
+                  [--limit MB] [--proxy URL]
                   [url]
 
 positional arguments:
@@ -108,7 +123,11 @@ options:
   -h, --help            show this help message and exit
   --update, --check-updates
                         Check for game updates via CDN headers, ETags, and version probing.
-                        Scans all games if no URL is provided, or checks/updates a specific game
+                        Scans all games if no URL is provided, or checks a specific game
+  --updateall [DIR]     Recursively discovers and checks all game installations inside DIR
+                        (defaults to 'downloads/')
+  -y, --yes             Automatically accept update prompts and download detected updates
+                        without confirmation
   -o, --folder, --out NAME
                         Custom output directory name (default: auto-named 'downloads/<engine_type>/<Game_Name>-<Version>')
   --play-now, --stream  Play immediately! Starts an on-demand caching server and streams

@@ -1454,51 +1454,90 @@ class GameUpdateChecker:
                 "message": f"Connection error: {e}"
             }
 
+    @staticmethod
+    def is_game_directory(path):
+        """Determines if a directory contains a game (Ren'Py, Twine, HTML5, etc.)."""
+        if not os.path.isdir(path):
+            return False
+        try:
+            entries = set(os.listdir(path))
+        except Exception:
+            return False
+        if "game_meta.json" in entries:
+            return True
+        if any(f in entries for f in ["game.zip", "renpy.wasm", "renpy.js", "renpy.data"]):
+            return True
+        if "index.html" in entries:
+            return True
+        if any(f in entries for f in ["data.js", "c2runtime.js", "c3runtime.js"]):
+            return True
+        return False
+
     @classmethod
-    def check_all_downloaded_games(cls, base_download_dir="downloads", verify_ssl=True, max_workers=8):
-        """Scans all downloaded games in downloads/html and downloads/renpy and checks for updates."""
-        games_to_check = []
-        for cat in ["html", "renpy"]:
-            cat_dir = os.path.join(base_download_dir, cat)
-            if not os.path.exists(cat_dir):
-                continue
-            for folder in sorted(os.listdir(cat_dir)):
-                folder_path = os.path.join(cat_dir, folder)
-                if not os.path.isdir(folder_path):
-                    continue
-                meta_file = os.path.join(folder_path, "game_meta.json")
-                meta = {}
-                if os.path.exists(meta_file):
-                    try:
-                        with open(meta_file, "r", encoding="utf-8") as f:
-                            meta = json.load(f)
-                    except Exception:
-                        pass
+    def find_game_directories(cls, root_dir):
+        """Recursively walks root_dir to discover all game directories without descending into discovered games."""
+        game_dirs = []
+        if not os.path.exists(root_dir):
+            return game_dirs
 
-                local_mtime = None
-                index_file = os.path.join(folder_path, "index.html")
-                if os.path.exists(index_file):
-                    local_mtime = datetime.fromtimestamp(os.path.getmtime(index_file), tz=timezone.utc)
-                elif os.path.exists(meta_file):
-                    local_mtime = datetime.fromtimestamp(os.path.getmtime(meta_file), tz=timezone.utc)
+        if cls.is_game_directory(root_dir):
+            return [root_dir]
 
-                url = meta.get("game_url") or meta.get("cdn_url") or meta.get("source_url")
-                games_to_check.append({
-                    "folder": folder,
-                    "category": cat,
-                    "path": folder_path,
-                    "url": url,
-                    "local_version": meta.get("version"),
-                    "local_etag": meta.get("etag"),
-                    "local_mtime": local_mtime
-                })
+        for root, dirs, files in os.walk(root_dir):
+            keep_dirs = []
+            for d in list(dirs):
+                full_d = os.path.join(root, d)
+                if cls.is_game_directory(full_d):
+                    game_dirs.append(full_d)
+                else:
+                    keep_dirs.append(d)
+            dirs[:] = keep_dirs
 
-        if not games_to_check:
-            print("[*] No downloaded games found in 'downloads/'.")
+        return sorted(list(set(game_dirs)))
+
+    @classmethod
+    def check_all_downloaded_games(cls, target_dir="downloads", verify_ssl=True, max_workers=8):
+        """Recursively discovers all games inside target_dir and checks for updates."""
+        game_paths = cls.find_game_directories(target_dir)
+        if not game_paths:
+            print(f"[*] No game installations found inside '{target_dir}'.")
             return []
 
+        games_to_check = []
+        for folder_path in game_paths:
+            folder_name = os.path.basename(folder_path)
+            parent_name = os.path.basename(os.path.dirname(folder_path))
+            cat = parent_name if parent_name in ["html", "renpy"] else "game"
+
+            meta_file = os.path.join(folder_path, "game_meta.json")
+            meta = {}
+            if os.path.exists(meta_file):
+                try:
+                    with open(meta_file, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                except Exception:
+                    pass
+
+            local_mtime = None
+            index_file = os.path.join(folder_path, "index.html")
+            if os.path.exists(index_file):
+                local_mtime = datetime.fromtimestamp(os.path.getmtime(index_file), tz=timezone.utc)
+            elif os.path.exists(meta_file):
+                local_mtime = datetime.fromtimestamp(os.path.getmtime(meta_file), tz=timezone.utc)
+
+            url = meta.get("game_url") or meta.get("cdn_url") or meta.get("source_url")
+            games_to_check.append({
+                "folder": folder_name,
+                "category": cat,
+                "path": folder_path,
+                "url": url,
+                "local_version": meta.get("version"),
+                "local_etag": meta.get("etag"),
+                "local_mtime": local_mtime
+            })
+
         print("=" * 90)
-        print(f" Checking updates for {len(games_to_check)} downloaded games...")
+        print(f" Checking updates for {len(games_to_check)} game(s) in '{target_dir}'...")
         print("=" * 90)
 
         def worker(game):
@@ -1537,7 +1576,6 @@ class GameUpdateChecker:
             for g, r in updates_found:
                 new_tgt = r.get("remote_url", g["url"])
                 print(f"    * {g['folder']} -> {r.get('message')}")
-                print(f"      To download: python scraper.py \"{new_tgt}\"")
         else:
             print("\n[+] All checked games are up to date!")
         print("=" * 90 + "\n")
@@ -2174,11 +2212,14 @@ Examples:
   # Conserve bandwidth: download text & images only, skipping heavy videos:
   python scraper.py "https://game-portal.com/games/space-adventure" --no-videos
 
-  # Check for updates across all downloaded games:
-  python scraper.py --update
+  # Check for updates across all downloaded games (or specific directory):
+  python scraper.py --updateall
+  python scraper.py --updateall "downloads/html"
+  python scraper.py --updateall -y
 
-  # Check if a specific game or local installation has an update:
+  # Check if a specific game has an update:
   python scraper.py "Seven_Sins-v1.10" --update
+  python scraper.py "Seven_Sins-v1.10" --update -y
   python scraper.py "https://gamcore.com/games/seven_sins" --update
 
   # Stop after 250 MB downloaded (safe for limited data plans, resumable anytime):
@@ -2191,7 +2232,9 @@ Examples:
     )
 
     parser.add_argument("url", nargs="?", default=None, help="Target URL (Game portal page URL or direct game iframe/CDN URL) or local downloaded game directory")
-    parser.add_argument("--update", "--check-updates", "--check-update", dest="update", action="store_true", help="Check for game updates via CDN headers, ETags, and version probing. Scans all games if no URL is provided, or checks/updates a specific game if a URL or folder is given.")
+    parser.add_argument("--update", "--check-updates", "--check-update", dest="update", action="store_true", help="Check for game updates via CDN headers, ETags, and version probing. Scans all games if no URL is given, or checks a specific game.")
+    parser.add_argument("--updateall", "--update-all", dest="updateall", nargs="?", const="downloads", default=None, metavar="DIR", help="Recursively discovers and checks all game installations inside DIR (defaults to 'downloads/').")
+    parser.add_argument("-y", "--yes", dest="auto_yes", action="store_true", help="Automatically accept update prompts and download detected updates without confirmation.")
     parser.add_argument("-o", "--folder", "--out", dest="folder", type=str, metavar="NAME", help="Custom output directory name (default: auto-named 'downloads/<engine_type>/<Game_Name>-<Version>')")
     parser.add_argument("--play-now", "--stream", dest="play_now", action="store_true", help="Play immediately! Starts an on-demand caching server and streams missing assets live while downloading in background")
     parser.add_argument("--stream-only", "--lazy", dest="stream_only", action="store_true", help="Conserve bandwidth: launches game server and streams assets ONLY on-demand as you play (disables background pre-downloading)")
@@ -2206,21 +2249,60 @@ Examples:
 
     args = parser.parse_args()
 
-    if not args.url and not args.update:
+    if not args.url and not args.update and args.updateall is None:
         parser.print_help()
         sys.exit(0)
 
     play_now = args.play_now or args.stream_only
 
-    if args.update:
-        if not args.url:
-            GameUpdateChecker.check_all_downloaded_games(
-                base_download_dir="downloads",
-                verify_ssl=not args.no_verify,
-                max_workers=args.threads
-            )
-            return
+    # Handle --updateall or --update without URL
+    if args.updateall is not None or (args.update and not args.url):
+        scan_dir = args.updateall if args.updateall is not None else "downloads"
+        updates_found = GameUpdateChecker.check_all_downloaded_games(
+            target_dir=scan_dir,
+            verify_ssl=not args.no_verify,
+            max_workers=args.threads
+        )
+        if updates_found:
+            proceed = False
+            if args.auto_yes:
+                print(f"[*] -y / --yes provided: automatically downloading {len(updates_found)} update(s)...")
+                proceed = True
+            else:
+                try:
+                    ans = input(f"[?] {len(updates_found)} update(s) available. Download updates now? [y/N]: ").strip().lower()
+                    if ans in ['y', 'yes']:
+                        proceed = True
+                    else:
+                        print("[*] Update download skipped by user.")
+                except (KeyboardInterrupt, EOFError):
+                    print("\n[*] Aborted.")
+                    return
 
+            if proceed:
+                for g, r in updates_found:
+                    new_tgt = r.get("remote_url", g["url"])
+                    print("\n" + "=" * 80)
+                    print(f"[*] Updating '{g['folder']}' from: {new_tgt}")
+                    print("=" * 80)
+                    grab_game(
+                        url=new_tgt,
+                        output_folder=args.folder,
+                        headed=args.headed,
+                        no_verify=args.no_verify,
+                        wait_idle=args.wait,
+                        serve=False,
+                        play_now=False,
+                        max_workers=args.threads,
+                        proxy=args.proxy,
+                        no_videos=args.no_videos,
+                        stream_only=args.stream_only,
+                        limit_mb=args.limit
+                    )
+        return
+
+    # Handle --update on a specific game or URL
+    if args.update:
         target = args.url
         local_path = None
         for candidate in [
@@ -2271,22 +2353,40 @@ Examples:
             print("\n" + "=" * 80)
             print(f"[!] UPDATE DETECTED: {res.get('message')}")
             download_url = res.get("remote_url", remote_url)
-            print(f"[*] Proceeding to download updated version from: {download_url}")
-            print("=" * 80 + "\n")
-            grab_game(
-                url=download_url,
-                output_folder=args.folder,
-                headed=args.headed,
-                no_verify=args.no_verify,
-                wait_idle=args.wait,
-                serve=args.serve,
-                play_now=play_now,
-                max_workers=args.threads,
-                proxy=args.proxy,
-                no_videos=args.no_videos,
-                stream_only=args.stream_only,
-                limit_mb=args.limit
-            )
+            print(f"[*] Update Origin URL  : {download_url}")
+            print("=" * 80)
+
+            proceed = False
+            if args.auto_yes:
+                print("[*] -y / --yes provided: proceeding with download automatically.")
+                proceed = True
+            else:
+                try:
+                    ans = input("\n[?] An update is available. Download this update now? [y/N]: ").strip().lower()
+                    if ans in ['y', 'yes']:
+                        proceed = True
+                    else:
+                        print("[*] Update download skipped by user.")
+                except (KeyboardInterrupt, EOFError):
+                    print("\n[*] Aborted.")
+                    return
+
+            if proceed:
+                print(f"[*] Proceeding to download updated version from: {download_url}\n")
+                grab_game(
+                    url=download_url,
+                    output_folder=args.folder,
+                    headed=args.headed,
+                    no_verify=args.no_verify,
+                    wait_idle=args.wait,
+                    serve=args.serve,
+                    play_now=play_now,
+                    max_workers=args.threads,
+                    proxy=args.proxy,
+                    no_videos=args.no_videos,
+                    stream_only=args.stream_only,
+                    limit_mb=args.limit
+                )
         else:
             print("\n" + "-" * 80)
             print(f"[+] Status: {res.get('message', 'Game is up to date.')}")
