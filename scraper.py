@@ -25,7 +25,7 @@ import threading
 import http.server
 import socketserver
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
+from email.utils import parsedate_to_datetime, formatdate
 from urllib.parse import urlparse, urljoin, unquote, quote, urlunparse
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from tqdm import tqdm
@@ -283,45 +283,127 @@ def file_md5(file_path, chunk_size=65536):
     except Exception:
         return None
 
-def build_size_index(folder):
+def load_asset_manifest(folder):
     """
-    Builds a dictionary mapping file size in bytes to a list of local file paths.
-    Only indexes files > 10KB to avoid collisions on trivial small files.
+    Loads persistent asset manifest from game_meta.json if present.
+    Returns:
+        dict: {rel_path: {"etag": str, "size": int, "mtime": float}}
     """
+    if not folder:
+        return {}
+    meta_path = os.path.join(folder, "game_meta.json")
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+                return meta.get("assets_manifest", {})
+        except Exception:
+            pass
+    return {}
+
+def save_asset_manifest(folder, manifest):
+    """
+    Saves/updates persistent asset manifest inside game_meta.json.
+    """
+    if not folder or not manifest:
+        return
+    meta_path = os.path.join(folder, "game_meta.json")
+    meta = {}
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            pass
+    meta["assets_manifest"] = manifest
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+    except Exception:
+        pass
+
+def build_asset_index(folder, manifest=None, max_workers=8):
+    """
+    Builds in-memory lookup indexes for fast differential updates:
+      - etag_index: mapping from etag (hex MD5) -> local_abs_path
+      - size_index: mapping from file_size -> [local_abs_path, ...]
+      - manifest: {rel_path: {"etag": ..., "size": ..., "mtime": ...}}
+    Reuses existing manifest data for instant zero-overhead lookups,
+    and parallel-hashes un-indexed files across worker threads.
+    """
+    if manifest is None:
+        manifest = load_asset_manifest(folder)
+
+    etag_index = {}
     size_index = {}
-    if not folder or not os.path.isdir(folder):
-        return size_index
     skip_files = {"index.html", "game_meta.json", "run_game.bat", "run_game.py"}
+
+    if not folder or not os.path.isdir(folder):
+        return etag_index, size_index, manifest
+
+    unindexed_files = []
+
     for root, dirs, files in os.walk(folder):
         for f in files:
             if f in skip_files or f.endswith(".part"):
                 continue
-            p = os.path.join(root, f)
+            abs_p = os.path.join(root, f)
+            rel_p = os.path.relpath(abs_p, folder).replace("\\", "/")
             try:
-                sz = os.path.getsize(p)
-                if sz > 10240:
-                    if sz not in size_index:
-                        size_index[sz] = []
-                    size_index[sz].append(p)
+                st = os.stat(abs_p)
+                sz = st.st_size
+                mtime = st.st_mtime
             except Exception:
-                pass
-    return size_index
+                continue
+
+            if sz > 0:
+                if sz > 10240:
+                    size_index.setdefault(sz, []).append(abs_p)
+
+                cached_entry = manifest.get(rel_p)
+                if cached_entry and cached_entry.get("size") == sz and abs(cached_entry.get("mtime", 0) - mtime) < 1.0:
+                    etag = cached_entry.get("etag")
+                    if etag:
+                        etag_index[etag.strip('"').lower()] = abs_p
+                else:
+                    if sz < 100 * 1024 * 1024:
+                        unindexed_files.append((abs_p, rel_p, sz, mtime))
+
+    if unindexed_files:
+        def worker(item):
+            ap, rp, s, mt = item
+            h = file_md5(ap)
+            return ap, rp, s, mt, h
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            for ap, rp, s, mt, h in ex.map(worker, unindexed_files):
+                if h:
+                    manifest[rp] = {"etag": h, "size": s, "mtime": mt}
+                    etag_index[h.strip('"').lower()] = ap
+
+        save_asset_manifest(folder, manifest)
+
+    return etag_index, size_index, manifest
 
 def seed_existing_assets(source_folder, dest_folder):
     """
-    Seeds dest_folder with media assets from source_folder using hardlinks (or fast copy fallback).
-    Excludes entry points, launchers, and metadata so fresh ones are generated.
+    Seeds dest_folder with media assets from source_folder using fast hardlinks (or copy fallback).
+    Copies source manifest to dest folder for instant zero-overhead ETag lookups.
     Returns:
         seeded_count (int): number of seeded files
-        size_index (dict): mapping from file_size -> [local_abs_path, ...] for fast rename detection
+        etag_index (dict): mapping from etag -> local_abs_path
+        size_index (dict): mapping from file_size -> [local_abs_path, ...]
+        manifest (dict): asset manifest
     """
     if not source_folder or not os.path.isdir(source_folder) or os.path.abspath(source_folder) == os.path.abspath(dest_folder):
-        return 0, {}
+        return 0, {}, {}, {}
 
     os.makedirs(dest_folder, exist_ok=True)
     seeded_count = 0
-    size_index = {}
     skip_files = {"index.html", "game_meta.json", "run_game.bat", "run_game.py"}
+
+    src_manifest = load_asset_manifest(source_folder)
+    dest_manifest = {}
 
     for root, dirs, files in os.walk(source_folder):
         for f in files:
@@ -329,6 +411,7 @@ def seed_existing_assets(source_folder, dest_folder):
                 continue
             src_path = os.path.join(root, f)
             rel_path = os.path.relpath(src_path, source_folder)
+            rel_posix = rel_path.replace("\\", "/")
             dst_path = os.path.join(dest_folder, rel_path)
 
             if not os.path.exists(dst_path):
@@ -342,17 +425,11 @@ def seed_existing_assets(source_folder, dest_folder):
                         continue
                 seeded_count += 1
 
-            if os.path.exists(dst_path):
-                try:
-                    sz = os.path.getsize(dst_path)
-                    if sz > 10240:
-                        if sz not in size_index:
-                            size_index[sz] = []
-                        size_index[sz].append(dst_path)
-                except Exception:
-                    pass
+            if rel_posix in src_manifest:
+                dest_manifest[rel_posix] = dict(src_manifest[rel_posix])
 
-    return seeded_count, size_index
+    etag_index, size_index, manifest = build_asset_index(dest_folder, manifest=dest_manifest)
+    return seeded_count, etag_index, size_index, manifest
 
 def find_existing_game_folder(clean_title, current_target_folder, base_dir="downloads"):
     """
@@ -990,9 +1067,9 @@ class ConstructHandler:
 # ==============================================================================
 
 class AssetDownloader:
-    """Downloads files with streaming, multi-threading, Range-resuming, data-limit caps, atomic .part renaming, differential updates, and rename reuse."""
+    """Downloads files with streaming, multi-threading, Range-resuming, data-limit caps, atomic .part renaming, RFC 7232 conditional updates, and cryptographic ETag reuse."""
 
-    def __init__(self, base_url, download_folder, session, verify_ssl=True, max_workers=8, max_mb=None, diff_check=False, size_index=None):
+    def __init__(self, base_url, download_folder, session, verify_ssl=True, max_workers=8, max_mb=None, diff_check=False, etag_index=None, size_index=None, manifest=None):
         self.base_url = base_url
         self.download_folder = download_folder
         self.session = session
@@ -1004,7 +1081,9 @@ class AssetDownloader:
         self.stop_requested = False
         self._lock = threading.Lock()
         self.diff_check = diff_check
+        self.etag_index = etag_index if etag_index is not None else {}
         self.size_index = size_index if size_index is not None else {}
+        self.manifest = manifest if manifest is not None else {}
         self.cached_count = 0
         self.reused_count = 0
         self.updated_count = 0
@@ -1027,6 +1106,7 @@ class AssetDownloader:
         if folder:
             os.makedirs(folder, exist_ok=True)
 
+        rel_p = os.path.relpath(local_path, self.download_folder).replace("\\", "/")
         is_modified = False
 
         # 1. Existing local file handling
@@ -1038,35 +1118,71 @@ class AssetDownloader:
                 except Exception:
                     pass
             elif self.diff_check:
-                status_code, remote_len, remote_etag, remote_lm = get_remote_file_info(
-                    self.session, full_url, referer=self.base_url, verify_ssl=self.verify_ssl
-                )
-                if status_code in [200, 206]:
-                    if remote_len > 0 and remote_len != size:
-                        is_modified = True
-                        try:
-                            os.remove(local_path)
-                        except Exception:
-                            pass
-                    elif remote_etag and len(remote_etag) == 32 and size < 10 * 1024 * 1024:
-                        local_md5 = file_md5(local_path)
-                        if local_md5 and local_md5 != remote_etag.lower():
-                            is_modified = True
-                            try:
-                                os.remove(local_path)
-                            except Exception:
-                                pass
-                        else:
-                            with self._lock:
-                                self.cached_count += 1
-                            return True, 0, "cached"
-                    else:
+                # RFC 7232 HTTP Conditional Request (1 network round trip)
+                entry = self.manifest.get(rel_p, {})
+                known_etag = entry.get("etag")
+                mtime = entry.get("mtime")
+
+                if not known_etag:
+                    try:
+                        st = os.stat(local_path)
+                        mtime = st.st_mtime
+                        if st.st_size < 100 * 1024 * 1024:
+                            known_etag = file_md5(local_path)
+                            if known_etag:
+                                with self._lock:
+                                    self.manifest[rel_p] = {"etag": known_etag, "size": st.st_size, "mtime": mtime}
+                                    self.etag_index[known_etag.strip('"').lower()] = local_path
+                    except Exception:
+                        pass
+
+                headers = {}
+                if self.base_url:
+                    headers["Referer"] = self.base_url
+                if known_etag:
+                    headers["If-None-Match"] = f'"{known_etag.strip(chr(34))}"'
+                if mtime:
+                    headers["If-Modified-Since"] = formatdate(mtime, usegmt=True)
+
+                parsed_url = urlparse(full_url)
+                safe_path = quote(unquote(parsed_url.path.replace('+', '%2B')), safe="/()'!~,-_.@")
+                safe_request_url = urlunparse((parsed_url.scheme, parsed_url.netloc, safe_path, parsed_url.params, parsed_url.query, parsed_url.fragment))
+
+                try:
+                    r = self.session.get(safe_request_url, headers=headers, verify=self.verify_ssl, stream=True, timeout=25)
+                    if r.status_code == 304:
+                        # 100% verified unchanged by server
                         with self._lock:
                             self.cached_count += 1
                         return True, 0, "cached"
-                elif status_code in [404, 403]:
-                    return False, 0, f"http_{status_code}"
-                else:
+                    elif r.status_code == 200:
+                        ret_etag = r.headers.get("ETag", "").strip('"').lower()
+                        ret_len = int(r.headers.get("Content-Length", 0) or 0)
+                        if known_etag and ret_etag == known_etag.lower() and ret_len == os.path.getsize(local_path):
+                            with self._lock:
+                                self.cached_count += 1
+                            return True, 0, "cached"
+
+                        # File was modified! Stream new content to .part file
+                        is_modified = True
+                        part_path = local_path + ".part"
+                        downloaded_bytes = 0
+                        with open(part_path, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=65536):
+                                if chunk:
+                                    f.write(chunk)
+                                    downloaded_bytes += len(chunk)
+                                    with self._lock:
+                                        self.total_downloaded_bytes += len(chunk)
+                        os.replace(part_path, local_path)
+                        new_etag = ret_etag or (file_md5(local_path) if downloaded_bytes < 100 * 1024 * 1024 else None)
+                        with self._lock:
+                            self.updated_count += 1
+                            self.manifest[rel_p] = {"etag": new_etag, "size": downloaded_bytes, "mtime": time.time()}
+                        return True, downloaded_bytes, "updated"
+                    elif r.status_code in [404, 403]:
+                        return False, 0, f"http_{r.status_code}"
+                except Exception:
                     with self._lock:
                         self.cached_count += 1
                     return True, 0, "cached"
@@ -1075,12 +1191,29 @@ class AssetDownloader:
                     self.cached_count += 1
                 return True, 0, "cached"
 
-        # 2. Rename detection: if file does not exist locally, check if identical content exists under another name
-        if not os.path.exists(local_path) and self.size_index and not is_modified:
+        # 2. Rename & relocation detection (Cryptographic MD5 Matching)
+        if not os.path.exists(local_path) and not is_modified:
             status_code, remote_len, remote_etag, remote_lm = get_remote_file_info(
                 self.session, full_url, referer=self.base_url, verify_ssl=self.verify_ssl
             )
-            if status_code in [200, 206] and remote_len > 10240 and remote_len in self.size_index:
+            clean_etag = (remote_etag or "").strip('"').lower()
+
+            # Strategy 1: Direct cryptographic MD5 ETag match (0% error)
+            if clean_etag and len(clean_etag) == 32 and clean_etag in self.etag_index:
+                cand_path = self.etag_index[clean_etag]
+                if os.path.exists(cand_path):
+                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                    try:
+                        os.link(cand_path, local_path)
+                    except Exception:
+                        shutil.copy2(cand_path, local_path)
+                    with self._lock:
+                        self.reused_count += 1
+                        self.manifest[rel_p] = {"etag": clean_etag, "size": os.path.getsize(local_path), "mtime": time.time()}
+                    return True, 0, "reused_rename"
+
+            # Strategy 2: Size match + 8KB byte prefix match (Fallback for non-MD5 ETags)
+            if remote_len > 10240 and remote_len in self.size_index:
                 cand_paths = self.size_index[remote_len]
                 for cand_path in cand_paths:
                     if os.path.exists(cand_path) and os.path.getsize(cand_path) == remote_len:
@@ -1102,6 +1235,7 @@ class AssetDownloader:
                                     shutil.copy2(cand_path, local_path)
                                 with self._lock:
                                     self.reused_count += 1
+                                    self.manifest[rel_p] = {"etag": clean_etag, "size": remote_len, "mtime": time.time()}
                                 return True, 0, "reused_rename"
                         except Exception:
                             pass
@@ -1181,9 +1315,11 @@ class AssetDownloader:
 
                     os.replace(part_path, local_path)
                     status_name = "updated" if is_modified else "resumed"
+                    new_etag = r.headers.get("ETag", "").strip('"').lower() or (file_md5(local_path) if os.path.getsize(local_path) < 100 * 1024 * 1024 else None)
                     with self._lock:
                         if is_modified:
                             self.updated_count += 1
+                        self.manifest[rel_p] = {"etag": new_etag, "size": os.path.getsize(local_path), "mtime": time.time()}
                     return True, downloaded_bytes, status_name
 
                 elif r.status_code == 200:
@@ -1208,20 +1344,24 @@ class AssetDownloader:
 
                     os.replace(part_path, local_path)
                     status_name = "updated" if is_modified else "downloaded"
+                    new_etag = r.headers.get("ETag", "").strip('"').lower() or (file_md5(local_path) if os.path.getsize(local_path) < 100 * 1024 * 1024 else None)
                     with self._lock:
                         if is_modified:
                             self.updated_count += 1
                         else:
                             self.downloaded_count += 1
+                        self.manifest[rel_p] = {"etag": new_etag, "size": os.path.getsize(local_path), "mtime": time.time()}
                     return True, downloaded_bytes, status_name
 
                 elif r.status_code == 416:
                     if os.path.exists(part_path) and os.path.getsize(part_path) > 715:
                         os.replace(part_path, local_path)
                         status_name = "updated" if is_modified else "completed"
+                        new_etag = file_md5(local_path) if os.path.getsize(local_path) < 100 * 1024 * 1024 else None
                         with self._lock:
                             if is_modified:
                                 self.updated_count += 1
+                            self.manifest[rel_p] = {"etag": new_etag, "size": os.path.getsize(local_path), "mtime": time.time()}
                         return True, 0, status_name
                     elif os.path.exists(part_path):
                         os.remove(part_path)
@@ -1318,6 +1458,9 @@ class AssetDownloader:
                             except StopIteration:
                                 pass
 
+        # Persist updated asset manifest to game_meta.json
+        save_asset_manifest(self.download_folder, self.manifest)
+
         mb_down = self.total_downloaded_bytes / (1024 * 1024)
         print("\n" + "=" * 75)
         print(" [+] Asset Transfer & Update Summary:")
@@ -1344,11 +1487,6 @@ class AssetDownloader:
                 missing_count += 1
 
         audit_msg = f"[AUDIT] Verified on disk: {verified_count}/{total} files intact."
-        if missing_count > 0:
-            audit_msg += f" ({missing_count} files not present on disk)"
-        print(audit_msg)
-
-        return success_count, failed_count, (limit_hit or self.stop_requested)
         if missing_count > 0:
             audit_msg += f" ({missing_count} files not present on disk)"
         print(audit_msg)
@@ -2030,15 +2168,18 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
     if not seed_folder:
         seed_folder = detected_prior_folder or find_existing_game_folder(clean_title, target_folder, base_dir=base_download_dir)
 
+    etag_index = {}
     size_index = {}
+    manifest = {}
+
     if seed_folder and os.path.abspath(seed_folder) != os.path.abspath(target_folder):
         print(f"[*] Previous version detected at: {seed_folder}")
         print(f"[*] Seeding assets into '{target_folder}' via hardlinks for instant differential update...")
-        seeded_count, size_index = seed_existing_assets(seed_folder, target_folder)
+        seeded_count, etag_index, size_index, manifest = seed_existing_assets(seed_folder, target_folder)
         print(f"[+] Fast-seeded {seeded_count} assets from previous version (0 extra disk space).")
         diff_check = True
     elif os.path.exists(target_folder):
-        size_index = build_size_index(target_folder)
+        etag_index, size_index, manifest = build_asset_index(target_folder)
 
     os.makedirs(target_folder, exist_ok=True)
     print(f"[+] Output Directory: {os.path.abspath(target_folder)}")
@@ -2410,7 +2551,9 @@ if __name__ == "__main__":
         max_workers=max_workers,
         max_mb=limit_mb,
         diff_check=diff_check,
-        size_index=size_index
+        etag_index=etag_index,
+        size_index=size_index,
+        manifest=manifest
     )
     success_count, failed_count, limit_reached = downloader.download_batch(asset_map)
 

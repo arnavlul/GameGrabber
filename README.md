@@ -21,7 +21,7 @@ Universal browser game downloader and offline player. Download, archive, and pre
   - `--no-videos`: Downloads all story dialogue, audio, and images while skipping large video files.
 - **Instant Offline Runners:** Automatically writes `run_game.bat` and `run_game.py` (an RFC 7233 compliant multithreaded Range server) into the output directory for smooth seeking and playback.
 - **Lightweight Update Detection (`--update` & `--updateall`):** Check for newer versions and game patches in seconds using lightweight HTTP HEAD requests, ETag comparisons, Last-Modified timestamps, and intelligent CDN version probing without downloading heavy media files.
-- **Differential / Delta Updates & Rename Reuse (`--diff`):** When updating an existing game or version, GameGrabber instantly seeds existing media files via hardlinks (zero additional disk space). It verifies remote asset sizes and ETags, downloading *only* genuinely new or modified assets. If an asset was renamed or relocated by the developer, GameGrabber automatically matches file sizes and signatures to reuse the local asset without re-downloading.
+- **Cryptographic Differential Updates & Rename Reuse (`--diff`):** Uses RFC 7232 HTTP Conditional Requests (`If-None-Match` $\rightarrow$ `304 Not Modified`) to verify existing assets in a single network round-trip with zero bytes transferred. Automatically seeds assets via hardlinks, maintains a persistent asset manifest in `game_meta.json`, and detects renamed assets via exact MD5 ETag matches with 0% error.
 
 ---
 
