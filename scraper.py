@@ -2130,7 +2130,7 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
     os.makedirs(category_dir, exist_ok=True)
 
     if output_folder:
-        target_folder = output_folder if (os.path.isabs(output_folder) or output_folder.startswith(("downloads/", "downloads\\"))) else os.path.join(category_dir, output_folder)
+        target_folder = os.path.normpath(output_folder)
     else:
         cat_target = os.path.join(category_dir, default_folder)
         legacy_target = os.path.join(base_download_dir, default_folder)
@@ -2153,8 +2153,11 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
                 print(f"[!] VERSION MISMATCH DETECTED:")
                 print(f"    Existing download in '{target_folder}' is version: {prev_version}")
                 print(f"    Remote game is newer version: {detected_version}")
-                new_folder = os.path.join(category_dir, f"{clean_title}-{detected_version}")
-                print(f"[*] Resuming in separate folder '{new_folder}' to prevent data corruption!")
+                if output_folder:
+                    new_folder = target_folder
+                else:
+                    new_folder = os.path.join(category_dir, f"{clean_title}-{detected_version}")
+                print(f"[*] Resuming in folder '{new_folder}' to prevent data corruption!")
                 print("=" * 75 + "\n")
                 detected_prior_folder = target_folder
                 target_folder = new_folder
@@ -2651,6 +2654,11 @@ Examples:
   # Scrape a web game directly (saved into <Game_Name>-<Version>):
   python scraper.py "https://game-portal.com/games/space-adventure"
 
+  # Download to a specific custom directory (e.g. current directory '.', 'advancements', or 'special_downloads/here'):
+  python scraper.py "https://game-portal.com/games/space-adventure" .
+  python scraper.py "https://game-portal.com/games/space-adventure" advancements
+  python scraper.py "https://game-portal.com/games/space-adventure" special_downloads/here
+
   # Resume an interrupted download (automatically purges corrupt files and skips cached ones):
   python scraper.py "https://game-portal.com/games/space-adventure"
 
@@ -2680,11 +2688,12 @@ Examples:
     )
 
     parser.add_argument("url", nargs="?", default=None, help="Target URL (Game portal page URL or direct game iframe/CDN URL) or local downloaded game directory")
+    parser.add_argument("dest", nargs="?", default=None, help="Optional custom destination directory (e.g. '.', 'advancements', 'special_downloads/here'). Overrides default 'downloads/<engine>/<name>' path.")
     parser.add_argument("--update", "--check-updates", "--check-update", dest="update", action="store_true", help="Check for game updates via CDN headers, ETags, and version probing. Scans all games if no URL is given, or checks a specific game.")
     parser.add_argument("--updateall", dest="updateall", nargs="?", const="downloads", default=None, metavar="DIR", help="Recursively discovers and checks all game installations inside DIR (defaults to 'downloads/').")
     parser.add_argument("-y", "--yes", dest="auto_yes", action="store_true", help="Automatically accept update prompts and download detected updates without confirmation.")
     parser.add_argument("--diff", "--differential", action="store_true", help="Perform differential update check on existing assets (re-verifies remote sizes/hashes and re-downloads modified files).")
-    parser.add_argument("-o", "--folder", "--out", dest="folder", type=str, metavar="NAME", help="Custom output directory name (default: auto-named 'downloads/<engine_type>/<Game_Name>-<Version>')")
+    parser.add_argument("-o", "--folder", "--out", dest="folder", type=str, metavar="DIR", help="Custom output directory name (e.g. '.', 'advancements', 'special_downloads/here'). Overrides default 'downloads/<engine>/<name>' path.")
     parser.add_argument("--play-now", "--stream", dest="play_now", action="store_true", help="Play immediately! Starts an on-demand caching server and streams missing assets live while downloading in background")
     parser.add_argument("--stream-only", "--lazy", dest="stream_only", action="store_true", help="Conserve bandwidth: launches game server and streams assets ONLY on-demand as you play (disables background pre-downloading)")
     parser.add_argument("--no-videos", "--images-only", dest="no_videos", action="store_true", help="Conserve bandwidth: downloads all images/audio/text but skips heavy video files (.mp4/.webm)")
@@ -2697,6 +2706,7 @@ Examples:
     parser.add_argument("--proxy", type=str, metavar="URL", help="Optional HTTP/SOCKS5 proxy (e.g. http://127.0.0.1:8080 or socks5://127.0.0.1:1080)")
 
     args = parser.parse_args()
+    custom_dest = args.dest if args.dest is not None else args.folder
 
     if not args.url and not args.update and args.updateall is None:
         parser.print_help()
@@ -2736,7 +2746,7 @@ Examples:
                     print("=" * 80)
                     grab_game(
                         url=new_tgt,
-                        output_folder=args.folder,
+                        output_folder=custom_dest,
                         headed=args.headed,
                         no_verify=args.no_verify,
                         wait_idle=args.wait,
@@ -2826,7 +2836,7 @@ Examples:
                 print(f"[*] Proceeding to download updated version from: {download_url}\n")
                 grab_game(
                     url=download_url,
-                    output_folder=args.folder,
+                    output_folder=custom_dest,
                     headed=args.headed,
                     no_verify=args.no_verify,
                     wait_idle=args.wait,
@@ -2852,7 +2862,7 @@ Examples:
 
     grab_game(
         url=args.url,
-        output_folder=args.folder,
+        output_folder=custom_dest,
         headed=args.headed,
         no_verify=args.no_verify,
         wait_idle=args.wait,

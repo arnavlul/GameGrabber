@@ -76,9 +76,18 @@ Download text, audio, and images only, skipping heavy `.mp4`/`.webm` videos:
 python scraper.py "https://game-portal.com/games/space-adventure" --no-videos
 ```
 
-### 4. Custom Output & Parallel Worker Threads
+### 4. Custom Destination Directory & Parallel Worker Threads
+Specify any destination directory directly as a 2nd argument (e.g. `.`, `advancements`, or `special_downloads/here`), or via `-o` / `--out`:
 ```bash
-python scraper.py "https://game-host.com/game/index.html" -o "MyGame" --threads 12
+# Download directly into current directory (.):
+python scraper.py "https://game-portal.com/games/space-adventure" .
+
+# Download directly into a custom relative or absolute directory:
+python scraper.py "https://game-portal.com/games/space-adventure" advancements
+python scraper.py "https://game-portal.com/games/space-adventure" special_downloads/here
+
+# Using -o / --out with custom threads:
+python scraper.py "https://game-host.com/game/index.html" -o "special_downloads/here" --threads 12
 ```
 
 ### 5. Check for Updates (`--update` & `--updateall`)
@@ -117,14 +126,16 @@ python scraper.py "Seven_Sins-v1.10" --diff
 ## 📖 CLI Reference (`--help`)
 
 ```text
-usage: scraper.py [-h] [--update] [--updateall [DIR]] [-y] [--diff] [-o NAME]
+usage: scraper.py [-h] [--update] [--updateall [DIR]] [-y] [--diff] [-o DIR]
                   [--play-now] [--stream-only] [--no-videos] [--headed]
                   [--no-verify] [--wait SEC] [--threads N] [--serve]
                   [--limit MB] [--proxy URL]
-                  [url]
+                  [url] [dest]
 
 positional arguments:
   url                   Target URL (Game portal page URL or direct game iframe/CDN URL) or local game folder
+  dest                  Optional custom destination directory (e.g. '.', 'advancements', 'special_downloads/here').
+                        Overrides default 'downloads/<engine>/<name>' path.
 
 options:
   -h, --help            show this help message and exit
@@ -138,8 +149,9 @@ options:
   --diff, --differential
                         Perform differential update check on existing assets (re-verifies
                         remote sizes/hashes and re-downloads modified files)
-  -o, --folder, --out NAME
-                        Custom output directory name (default: auto-named 'downloads/<engine_type>/<Game_Name>-<Version>')
+  -o, --folder, --out DIR
+                        Custom output directory name (e.g. '.', 'advancements', 'special_downloads/here').
+                        Overrides default 'downloads/<engine_type>/<Game_Name>-<Version>')
   --play-now, --stream  Play immediately! Starts an on-demand caching server and streams
                         missing assets live while downloading in background
   --stream-only, --lazy Conserve bandwidth: launches game server and streams assets ONLY
