@@ -11,8 +11,10 @@ __pycache__/
 
 # Downloaded Games & Temporary Scratches
 downloads/
+temp/
 scratch/
 completed_links.txt
+DOWNLOADED_GAMES.md
 *-v*/
 *.part
 
@@ -20,3 +22,4 @@ completed_links.txt
 .vscode/
 .idea/
 .gemini/
+GEMINI.md

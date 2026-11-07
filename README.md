@@ -20,6 +20,7 @@ Universal browser game downloader and offline player. Download, archive, and pre
   - `--limit <MB>`: Caps total transferred data to a specific quota; safe for limited mobile hotspots or Wi-Fi.
   - `--no-videos`: Downloads all story dialogue, audio, and images while skipping large video files.
 - **Instant Offline Runners:** Automatically writes `run_game.bat` and `run_game.py` (an RFC 7233 compliant multithreaded Range server) into the output directory for smooth seeking and playback.
+- **Lightweight Update Detection (`--update`):** Check for newer versions and game patches in seconds using lightweight HTTP HEAD requests, ETag comparisons, Last-Modified timestamps, and intelligent CDN version probing without downloading heavy media files.
 
 ---
 
@@ -53,7 +54,7 @@ playwright install chromium
 ## 🚀 Usage & Examples
 
 ### 1. Basic Download
-Download a game and auto-generate an organized `<Game_Name>-<Version>` directory:
+Download a game and auto-generate an organized `downloads/<engine_type>/<Game_Name>-<Version>` directory (e.g., `downloads/html/` or `downloads/renpy/`):
 ```bash
 python scraper.py "https://game-portal.com/games/space-adventure"
 ```
@@ -79,6 +80,17 @@ python scraper.py "https://game-portal.com/games/space-adventure" --no-videos
 python scraper.py "https://game-host.com/game/index.html" -o "MyGame" --threads 12
 ```
 
+### 5. Check for Updates (`--update`)
+Scan your entire downloaded library for newly released versions or CDN build changes in seconds:
+```bash
+python scraper.py --update
+```
+Check a specific downloaded installation or remote game URL:
+```bash
+python scraper.py "downloads/html/Seven_Sins-v1.10" --update
+python scraper.py "https://gamcore.com/games/seven_sins" --update
+```
+
 ---
 
 ## 📖 CLI Reference (`--help`)
@@ -86,16 +98,19 @@ python scraper.py "https://game-host.com/game/index.html" -o "MyGame" --threads 
 ```text
 usage: scraper.py [-h] [-o NAME] [--play-now] [--stream-only] [--no-videos]
                   [--headed] [--no-verify] [--wait SEC] [--threads N]
-                  [--serve] [--limit MB] [--proxy URL]
-                  url
+                  [--serve] [--limit MB] [--proxy URL] [--update]
+                  [url]
 
 positional arguments:
-  url                   Target URL (Game portal page URL or direct game iframe/CDN URL)
+  url                   Target URL (Game portal page URL or direct game iframe/CDN URL) or local game folder
 
 options:
   -h, --help            show this help message and exit
+  --update, --check-updates
+                        Check for game updates via CDN headers, ETags, and version probing.
+                        Scans all games if no URL is provided, or checks/updates a specific game
   -o, --folder, --out NAME
-                        Custom output directory name (default: auto-named '<Game_Name>-<Version>')
+                        Custom output directory name (default: auto-named 'downloads/<engine_type>/<Game_Name>-<Version>')
   --play-now, --stream  Play immediately! Starts an on-demand caching server and streams
                         missing assets live while downloading in background
   --stream-only, --lazy Conserve bandwidth: launches game server and streams assets ONLY

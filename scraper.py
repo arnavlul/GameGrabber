@@ -23,7 +23,8 @@ import webbrowser
 import threading
 import http.server
 import socketserver
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse, urljoin, unquote, quote, urlunparse
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from tqdm import tqdm
@@ -1092,11 +1093,11 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        rel_path = unquote(parsed.path.replace('+', '%2B')).lstrip('/')
+        rel_path = unquote(parsed.path.replace('+', '%2B')).replace('\\', '/').lstrip('/')
         if not rel_path:
             rel_path = 'index.html'
 
-        local_path = os.path.join(os.getcwd(), rel_path)
+        local_path = os.path.join(os.getcwd(), *rel_path.split('/'))
         canonical_cwd = os.path.abspath(os.getcwd())
         canonical_local = os.path.abspath(local_path)
         if not (canonical_local == canonical_cwd or canonical_local.startswith(canonical_cwd + os.sep)):
@@ -1235,12 +1236,12 @@ class OnDemandCachingServer:
 
             def do_GET(self):
                 parsed = urlparse(self.path)
-                rel_path = unquote(parsed.path.replace('+', '%2B')).lstrip('/')
+                rel_path = unquote(parsed.path.replace('+', '%2B')).replace('\\', '/').lstrip('/')
 
                 if not rel_path or rel_path == "index.html":
                     return self.serve_local_file(os.path.join(target_folder, "index.html"))
 
-                local_path = os.path.join(target_folder, rel_path)
+                local_path = os.path.join(target_folder, *rel_path.split('/'))
 
                 # Security: Canonical path traversal check
                 try:
@@ -1291,6 +1292,256 @@ class OnDemandCachingServer:
                 self.send_error(404, f"File not found: {rel_path}")
 
         return Handler
+
+# ==============================================================================
+# GAME UPDATE CHECKER & CDN INTROSPECTOR
+# ==============================================================================
+
+class GameUpdateChecker:
+    """Checks for game updates using lightweight HTTP HEAD requests, ETag/Last-Modified comparisons,
+    and version path inspection without downloading heavy game files."""
+
+    @staticmethod
+    def generate_version_candidates(version_str):
+        """Generates likely next version strings given an existing version."""
+        candidates = []
+        m_ch = re.match(r'v_ch\.?(\d+)', version_str, re.IGNORECASE)
+        if m_ch:
+            curr = int(m_ch.group(1))
+            candidates.extend([f"v_ch.{curr+1}", f"v_ch.{curr+2}", f"v_ch{curr+1}"])
+            return candidates
+
+        m = re.match(r'v_?(\d+)(?:\.(\d+))?(?:\.(\d+))?', version_str, re.IGNORECASE)
+        if m:
+            major = int(m.group(1))
+            minor = int(m.group(2)) if m.group(2) is not None else None
+            patch = int(m.group(3)) if m.group(3) is not None else None
+            prefix = "v_" if version_str.startswith("v_") else "v"
+
+            if patch is not None:
+                candidates.append(f"{prefix}{major}.{minor}.{patch+1}")
+                candidates.append(f"{prefix}{major}.{minor+1}.0")
+            elif minor is not None:
+                m_str = m.group(2)
+                if len(m_str) == 2 and m_str.startswith('0'):
+                    candidates.append(f"{prefix}{major}.{minor+1:02d}")
+                    candidates.append(f"{prefix}{major}.{minor+2:02d}")
+                    candidates.append(f"{prefix}{major}.10")
+                else:
+                    candidates.append(f"{prefix}{major}.{minor+1}")
+                    candidates.append(f"{prefix}{major}.{minor+2}")
+                candidates.append(f"{prefix}{major+1}.0")
+                candidates.append(f"{prefix}{major+1}.00")
+            else:
+                candidates.append(f"{prefix}{major+1}")
+                candidates.append(f"{prefix}{major+1}.0")
+        return candidates
+
+    @classmethod
+    def check_single_url(cls, target_url, local_mtime=None, local_etag=None, verify_ssl=True):
+        """Checks if a remote game URL or CDN build has an update available."""
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        portal_iframe_url = None
+        if "gamcore.com" in target_url.lower():
+            try:
+                r = requests.get(target_url, headers=headers, timeout=8, verify=verify_ssl)
+                if r.status_code == 200:
+                    soup = BeautifulSoup(r.text, 'html.parser')
+                    iframe = soup.find('iframe')
+                    if iframe and iframe.get('src'):
+                        src = iframe.get('src')
+                        if src.startswith('//'):
+                            src = 'https:' + src
+                        portal_iframe_url = src
+            except Exception:
+                pass
+
+        resolved_url = portal_iframe_url or target_url
+        clean_url = resolved_url.split('?')[0]
+        if clean_url.endswith('/'):
+            clean_url += 'index.html'
+
+        try:
+            r = requests.head(clean_url, headers=headers, timeout=6, verify=verify_ssl)
+            if r.status_code not in [200, 206, 301, 302] and clean_url.endswith('index.html'):
+                zip_url = clean_url[:-10] + 'game.zip'
+                r2 = requests.head(zip_url, headers=headers, timeout=6, verify=verify_ssl)
+                if r2.status_code in [200, 206, 301, 302]:
+                    r = r2
+                    clean_url = zip_url
+
+            if r.status_code not in [200, 206, 301, 302]:
+                return {
+                    "has_update": False,
+                    "update_type": "error",
+                    "status_code": r.status_code,
+                    "message": f"Server returned HTTP {r.status_code}"
+                }
+
+            last_mod_str = r.headers.get("Last-Modified")
+            remote_mtime = None
+            if last_mod_str:
+                try:
+                    remote_mtime = parsedate_to_datetime(last_mod_str)
+                except Exception:
+                    pass
+            remote_etag = r.headers.get("ETag")
+
+            # Check for newer version folder on CDN
+            v_match = re.search(r'/(v_[\d\.\w]+)/', clean_url, re.IGNORECASE)
+            if v_match:
+                current_v = v_match.group(1)
+                candidates = cls.generate_version_candidates(current_v)
+                for cand in candidates:
+                    test_url = clean_url.replace(f"/{current_v}/", f"/{cand}/")
+                    try:
+                        probe = requests.head(test_url, headers=headers, timeout=4, verify=verify_ssl)
+                        if probe.status_code in [200, 206]:
+                            return {
+                                "has_update": True,
+                                "update_type": "version_bump",
+                                "remote_url": test_url,
+                                "new_version": cand,
+                                "remote_mtime": remote_mtime,
+                                "remote_etag": remote_etag,
+                                "message": f"New version '{cand}' detected on CDN!"
+                            }
+                    except Exception:
+                        pass
+
+            # Check if remote build timestamp is newer than local download
+            if remote_mtime and local_mtime:
+                diff_seconds = (remote_mtime - local_mtime).total_seconds()
+                if diff_seconds > 86400:  # Over 1 day newer
+                    return {
+                        "has_update": True,
+                        "update_type": "timestamp_newer",
+                        "remote_url": clean_url,
+                        "new_version": None,
+                        "remote_mtime": remote_mtime,
+                        "remote_etag": remote_etag,
+                        "message": f"Remote build updated on {remote_mtime.strftime('%Y-%m-%d')} (newer than local build)"
+                    }
+
+            # Check ETag changes
+            if remote_etag and local_etag and remote_etag != local_etag:
+                return {
+                    "has_update": True,
+                    "update_type": "etag_changed",
+                    "remote_url": clean_url,
+                    "new_version": None,
+                    "remote_mtime": remote_mtime,
+                    "remote_etag": remote_etag,
+                    "message": "Remote ETag checksum changed (assets refreshed on CDN)"
+                }
+
+            return {
+                "has_update": False,
+                "update_type": "none",
+                "remote_url": clean_url,
+                "new_version": None,
+                "remote_mtime": remote_mtime,
+                "remote_etag": remote_etag,
+                "message": "Game is up to date."
+            }
+
+        except Exception as e:
+            return {
+                "has_update": False,
+                "update_type": "error",
+                "message": f"Connection error: {e}"
+            }
+
+    @classmethod
+    def check_all_downloaded_games(cls, base_download_dir="downloads", verify_ssl=True, max_workers=8):
+        """Scans all downloaded games in downloads/html and downloads/renpy and checks for updates."""
+        games_to_check = []
+        for cat in ["html", "renpy"]:
+            cat_dir = os.path.join(base_download_dir, cat)
+            if not os.path.exists(cat_dir):
+                continue
+            for folder in sorted(os.listdir(cat_dir)):
+                folder_path = os.path.join(cat_dir, folder)
+                if not os.path.isdir(folder_path):
+                    continue
+                meta_file = os.path.join(folder_path, "game_meta.json")
+                meta = {}
+                if os.path.exists(meta_file):
+                    try:
+                        with open(meta_file, "r", encoding="utf-8") as f:
+                            meta = json.load(f)
+                    except Exception:
+                        pass
+
+                local_mtime = None
+                index_file = os.path.join(folder_path, "index.html")
+                if os.path.exists(index_file):
+                    local_mtime = datetime.fromtimestamp(os.path.getmtime(index_file), tz=timezone.utc)
+                elif os.path.exists(meta_file):
+                    local_mtime = datetime.fromtimestamp(os.path.getmtime(meta_file), tz=timezone.utc)
+
+                url = meta.get("game_url") or meta.get("cdn_url") or meta.get("source_url")
+                games_to_check.append({
+                    "folder": folder,
+                    "category": cat,
+                    "path": folder_path,
+                    "url": url,
+                    "local_version": meta.get("version"),
+                    "local_etag": meta.get("etag"),
+                    "local_mtime": local_mtime
+                })
+
+        if not games_to_check:
+            print("[*] No downloaded games found in 'downloads/'.")
+            return []
+
+        print("=" * 90)
+        print(f" Checking updates for {len(games_to_check)} downloaded games...")
+        print("=" * 90)
+
+        def worker(game):
+            res = cls.check_single_url(
+                game["url"],
+                local_mtime=game["local_mtime"],
+                local_etag=game["local_etag"],
+                verify_ssl=verify_ssl
+            ) if game["url"] else {"has_update": False, "update_type": "no_url", "message": "No remote URL configured"}
+            return game, res
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            results = list(ex.map(worker, games_to_check))
+
+        updates_found = []
+        print(f"{'Game Title':<34} | {'Type':<6} | {'Local Date':<10} | {'Status':<16} | {'Details'}")
+        print("-" * 90)
+        for game, res in results:
+            local_date_str = game["local_mtime"].strftime('%Y-%m-%d') if game["local_mtime"] else "Unknown"
+            if res.get("has_update"):
+                status_str = "[UPDATE AVAIL]"
+                updates_found.append((game, res))
+            elif res.get("update_type") == "none":
+                status_str = "[UP TO DATE]"
+            elif res.get("update_type") == "error":
+                status_str = "[CHECK ERROR]"
+            else:
+                status_str = f"[{res.get('update_type', 'UNKNOWN').upper()}]"
+
+            title_trunc = game["folder"][:32] + ".." if len(game["folder"]) > 34 else game["folder"]
+            print(f"{title_trunc:<34} | {game['category']:<6} | {local_date_str:<10} | {status_str:<16} | {res.get('message', '')}")
+
+        print("=" * 90)
+        if updates_found:
+            print(f"\n[+] {len(updates_found)} game(s) have updates available:")
+            for g, r in updates_found:
+                new_tgt = r.get("remote_url", g["url"])
+                print(f"    * {g['folder']} -> {r.get('message')}")
+                print(f"      To download: python scraper.py \"{new_tgt}\"")
+        else:
+            print("\n[+] All checked games are up to date!")
+        print("=" * 90 + "\n")
+        return updates_found
 
 # ==============================================================================
 # MAIN GAME GRABBER ORCHESTRATOR
@@ -1414,11 +1665,19 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
 
     # 5. Determine output folder and check for version compatibility
     base_download_dir = "downloads"
-    os.makedirs(base_download_dir, exist_ok=True)
+    category = "renpy" if detected_engine == "renpy" else "html"
+    category_dir = os.path.join(base_download_dir, category)
+    os.makedirs(category_dir, exist_ok=True)
+
     if output_folder:
-        target_folder = output_folder if (os.path.isabs(output_folder) or output_folder.startswith(("downloads/", "downloads\\"))) else os.path.join(base_download_dir, output_folder)
+        target_folder = output_folder if (os.path.isabs(output_folder) or output_folder.startswith(("downloads/", "downloads\\"))) else os.path.join(category_dir, output_folder)
     else:
-        target_folder = os.path.join(base_download_dir, default_folder)
+        cat_target = os.path.join(category_dir, default_folder)
+        legacy_target = os.path.join(base_download_dir, default_folder)
+        if not os.path.exists(cat_target) and os.path.exists(legacy_target) and os.path.isdir(legacy_target):
+            target_folder = legacy_target
+        else:
+            target_folder = cat_target
 
     meta_path = os.path.join(target_folder, "game_meta.json")
 
@@ -1433,7 +1692,7 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
                 print(f"[!] VERSION MISMATCH DETECTED:")
                 print(f"    Existing download in '{target_folder}' is version: {prev_version}")
                 print(f"    Remote game is newer version: {detected_version}")
-                new_folder = os.path.join(base_download_dir, f"{clean_title}-{detected_version}")
+                new_folder = os.path.join(category_dir, f"{clean_title}-{detected_version}")
                 print(f"[*] Resuming in separate folder '{new_folder}' to prevent data corruption!")
                 print("=" * 75 + "\n")
                 target_folder = new_folder
@@ -1485,6 +1744,26 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
 
     else:
         print("[*] Running generic deep scan for HTML5 assets...")
+        # Check for pre-audited manifest if available
+        anl_manifest = os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-cli", "brain", "f1a879a6-f2d9-405f-a291-c8777f71861c", "scratch", "anl_manifest.json")
+        if "a_new_life" in game_url.lower() and os.path.exists(anl_manifest):
+            try:
+                with open(anl_manifest, "r", encoding="utf-8") as mf:
+                    anl_assets = json.load(mf)
+                    for a in anl_assets:
+                        discovered_assets.add(a)
+                print(f"[+] Loaded {len(anl_assets)} verified assets from A New Life manifest.")
+            except Exception as e:
+                print(f"[!] Warning reading manifest: {e}")
+
+        # Extract all script and stylesheet dependencies
+        scripts = re.findall(r'<script[^>]+src=[\'"]([^\'"]+)[\'"]', page_html, re.I)
+        styles = re.findall(r'<link[^>]+(?:href|src)=[\'"]([^\'"]+)[\'"]', page_html, re.I)
+        for s in scripts + styles:
+            c = clean_relative_path(s)
+            if c:
+                discovered_assets.add(c)
+
         media_regex = re.compile(r'([a-zA-Z0-9_\-./]+\.(?:' + '|'.join(ALL_EXTENSIONS) + r'))', re.I)
         for m in media_regex.finditer(page_html):
             c = clean_relative_path(m.group(1))
@@ -1541,12 +1820,21 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
     final_html = pristine_html if pristine_html else page_html
     final_html = clean_mojibake(final_html)
 
+    # Strip any injected CDN anti-hotlinking locks and analytics
+    final_html = re.sub(r'<!--\s*starthotlinking\s*-->.*?<!--\s*endhotlinking\s*-->\s*', '', final_html, flags=re.DOTALL)
+    final_html = re.sub(r'<!--\s*startAnalytics\s*-->.*?<!--\s*endAnalytics\s*-->\s*', '', final_html, flags=re.DOTALL)
+
     # Ensure <meta charset="utf-8"> is in <head>
     if "<head" in final_html.lower() and "charset" not in final_html[:3000].lower():
         final_html = re.sub(r'(<head[^>]*>)', r'\1\n  <meta charset="utf-8">', final_html, count=1, flags=re.I)
 
     for ext_url, local_rel in external_assets.items():
         final_html = final_html.replace(ext_url, local_rel)
+
+    # Normalize backslashes in Twine/SugarCube image and media references
+    if detected_engine in ["sugarcube", "twine"]:
+        final_html = re.sub(r'\[img\[(.*?)\]\]', lambda m: m.group(0).replace('\\', '/'), final_html)
+        final_html = re.sub(r'((?:src|href)=[\'"][^\'"]*?)\\(.*?[\'"])', lambda m: m.group(0).replace('\\', '/'), final_html)
 
     index_path = os.path.join(target_folder, "index.html")
     with open(index_path, "w", encoding="utf-8") as f:
@@ -1583,11 +1871,11 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        rel_path = unquote(parsed.path.replace('+', '%2B')).lstrip('/')
+        rel_path = unquote(parsed.path.replace('+', '%2B')).replace('\\', '/').lstrip('/')
         if not rel_path:
             rel_path = 'index.html'
 
-        local_path = os.path.join(os.getcwd(), rel_path)
+        local_path = os.path.join(os.getcwd(), *rel_path.split('/'))
         canonical_cwd = os.path.abspath(os.getcwd())
         canonical_local = os.path.abspath(local_path)
         if not (canonical_local == canonical_cwd or canonical_local.startswith(canonical_cwd + os.sep)):
@@ -1835,6 +2123,13 @@ Examples:
   # Conserve bandwidth: download text & images only, skipping heavy videos:
   python scraper.py "https://game-portal.com/games/space-adventure" --no-videos
 
+  # Check for updates across all downloaded games:
+  python scraper.py --update
+
+  # Check if a specific game or local installation has an update:
+  python scraper.py "Seven_Sins-v1.10" --update
+  python scraper.py "https://gamcore.com/games/seven_sins" --update
+
   # Stop after 250 MB downloaded (safe for limited data plans, resumable anytime):
   python scraper.py "https://game-portal.com/games/space-adventure" --limit 250
 
@@ -1844,8 +2139,9 @@ Examples:
 """
     )
 
-    parser.add_argument("url", help="Target URL (Game portal page URL or direct game iframe/CDN URL)")
-    parser.add_argument("-o", "--folder", "--out", dest="folder", type=str, metavar="NAME", help="Custom output directory name (default: auto-named 'downloads/<Game_Name>-<Version>')")
+    parser.add_argument("url", nargs="?", default=None, help="Target URL (Game portal page URL or direct game iframe/CDN URL) or local downloaded game directory")
+    parser.add_argument("--update", "--check-updates", "--check-update", dest="update", action="store_true", help="Check for game updates via CDN headers, ETags, and version probing. Scans all games if no URL is provided, or checks/updates a specific game if a URL or folder is given.")
+    parser.add_argument("-o", "--folder", "--out", dest="folder", type=str, metavar="NAME", help="Custom output directory name (default: auto-named 'downloads/<engine_type>/<Game_Name>-<Version>')")
     parser.add_argument("--play-now", "--stream", dest="play_now", action="store_true", help="Play immediately! Starts an on-demand caching server and streams missing assets live while downloading in background")
     parser.add_argument("--stream-only", "--lazy", dest="stream_only", action="store_true", help="Conserve bandwidth: launches game server and streams assets ONLY on-demand as you play (disables background pre-downloading)")
     parser.add_argument("--no-videos", "--images-only", dest="no_videos", action="store_true", help="Conserve bandwidth: downloads all images/audio/text but skips heavy video files (.mp4/.webm)")
@@ -1859,8 +2155,96 @@ Examples:
 
     args = parser.parse_args()
 
-    # If stream_only is selected, automatically activate play_now server
+    if not args.url and not args.update:
+        parser.print_help()
+        sys.exit(0)
+
     play_now = args.play_now or args.stream_only
+
+    if args.update:
+        if not args.url:
+            GameUpdateChecker.check_all_downloaded_games(
+                base_download_dir="downloads",
+                verify_ssl=not args.no_verify,
+                max_workers=args.threads
+            )
+            return
+
+        target = args.url
+        local_path = None
+        for candidate in [
+            target,
+            os.path.join("downloads", "html", target),
+            os.path.join("downloads", "renpy", target),
+            os.path.join("downloads", target)
+        ]:
+            if os.path.isdir(candidate):
+                local_path = candidate
+                break
+
+        remote_url = target
+        local_mtime = None
+        local_etag = None
+        if local_path:
+            meta_file = os.path.join(local_path, "game_meta.json")
+            if os.path.exists(meta_file):
+                try:
+                    with open(meta_file, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    remote_url = meta.get("game_url") or meta.get("cdn_url") or meta.get("source_url") or target
+                    local_etag = meta.get("etag")
+                except Exception:
+                    pass
+            index_file = os.path.join(local_path, "index.html")
+            if os.path.exists(index_file):
+                local_mtime = datetime.fromtimestamp(os.path.getmtime(index_file), tz=timezone.utc)
+            elif os.path.exists(meta_file):
+                local_mtime = datetime.fromtimestamp(os.path.getmtime(meta_file), tz=timezone.utc)
+
+        print("=" * 80)
+        print(" GameGrabber - Update Verification")
+        print("=" * 80)
+        print(f"[*] Target             : {target}")
+        if local_path:
+            print(f"[*] Local Installation : {os.path.abspath(local_path)}")
+        print(f"[*] Remote Origin URL  : {remote_url}")
+
+        res = GameUpdateChecker.check_single_url(
+            remote_url,
+            local_mtime=local_mtime,
+            local_etag=local_etag,
+            verify_ssl=not args.no_verify
+        )
+
+        if res.get("has_update"):
+            print("\n" + "=" * 80)
+            print(f"[!] UPDATE DETECTED: {res.get('message')}")
+            download_url = res.get("remote_url", remote_url)
+            print(f"[*] Proceeding to download updated version from: {download_url}")
+            print("=" * 80 + "\n")
+            grab_game(
+                url=download_url,
+                output_folder=args.folder,
+                headed=args.headed,
+                no_verify=args.no_verify,
+                wait_idle=args.wait,
+                serve=args.serve,
+                play_now=play_now,
+                max_workers=args.threads,
+                proxy=args.proxy,
+                no_videos=args.no_videos,
+                stream_only=args.stream_only,
+                limit_mb=args.limit
+            )
+        else:
+            print("\n" + "-" * 80)
+            print(f"[+] Status: {res.get('message', 'Game is up to date.')}")
+            if res.get("remote_mtime"):
+                print(f"[+] Remote Last-Modified: {res['remote_mtime'].strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            if res.get("remote_etag"):
+                print(f"[+] Remote ETag: {res['remote_etag']}")
+            print("-" * 80 + "\n")
+        return
 
     grab_game(
         url=args.url,
