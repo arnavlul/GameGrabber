@@ -121,6 +121,24 @@ Updates automatically seed existing assets and only download the delta. You can 
 python scraper.py "Seven_Sins-v1.10" --diff
 ```
 
+### 7. Compact & Reclaim Storage Space (`--compact`)
+Recursively discovers downloaded games and compresses high-bitrate `.mp4` and `.webm` video assets in-place using FFmpeg:
+* **Prerequisite:** Requires [FFmpeg](https://ffmpeg.org) installed on your system (e.g., `winget install Gyan.FFmpeg`).
+* **Visually Lossless:** Re-encodes bloated raw renders (often 5,000–30,000 kbps) down to web-optimized CRF 23/31, shrinking games by 20% to 70%+ with zero perceptible quality loss in browser playback.
+* **Atomic Replacement:** Safely converts videos to `.tmp` files and only replaces the original if file size is reduced and conversion succeeded.
+* **Full Before & After Breakdown:** Prints per-game and total storage savings.
+
+```bash
+# Recursively scan and compact all games in downloads/:
+python scraper.py --compact
+
+# Compact a specific category or custom directory:
+python scraper.py --compact "downloads/html"
+
+# Compact a single specific game folder:
+python scraper.py --compact "The_DICKtator-v2.5.1"
+```
+
 ---
 
 ## 📖 CLI Reference (`--help`)

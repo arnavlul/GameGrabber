@@ -17,6 +17,7 @@ import html
 import shutil
 import hashlib
 import argparse
+import subprocess
 import mimetypes
 import urllib3
 import requests
@@ -147,31 +148,60 @@ def extract_game_identity(title, url, html_content=""):
     else:
         clean_title = raw_title
 
-    # 2. Search html_content if version not yet found
-    if not version and html_content:
-        m_var = re.search(r'(?:version|game_version|gameVersion|build_num)\s*[:=]\s*["\']v?([0-9]+(?:\.[0-9a-zA-Z_\-]+)*)["\']', html_content, re.I)
-        if m_var:
-            version = "v" + m_var.group(1).lstrip('vV')
-
-        if not version:
-            m_pkg = re.search(r'"version"\s*:\s*"v?([0-9]+(?:\.[0-9a-zA-Z_\-]+)*)"', html_content)
-            if m_pkg:
-                version = "v" + m_pkg.group(1).lstrip('vV')
+    # 2. Check URL path FIRST for explicit game version segments (e.g. /v_0.79/, /v1.08/, /v_ch.3/, /episode_1/)
+    # This prevents catching internal framework library versions (e.g. SugarCube 2.36.1 / 2.6.2) from HTML text
+    if not version and url:
+        parsed_url = urlparse(url)
+        path_segs = [s for s in parsed_url.path.strip('/').split('/') if s]
+        for seg in reversed(path_segs):
+            m_seg = re.match(r'^(?:v_?|ver_?|build_?)([0-9]+(?:\.[0-9a-zA-Z_\-]+)*)$', seg, re.I)
+            if m_seg:
+                version = "v" + m_seg.group(1)
+                break
+            m_ch = re.match(r'^(?:v_?)?(?:ch|chapter|ep|episode)[-_\.]?([0-9a-zA-Z_\-]+)$', seg, re.I)
+            if m_ch:
+                version = "v_ch." + m_ch.group(1)
+                break
 
     # 3. Check URL slug for version pattern: /game-name-v0.12/
-    if not version:
+    if not version and url:
         u_match = re.search(r'[-_](?:v|ver)?([0-9]+(?:\.[0-9a-zA-Z_\-]+)+)', url, re.I)
         if u_match:
             version = "v" + u_match.group(1).lstrip('vV')
 
+    # 4. Search html_content for explicit author game version variables
+    if not version and html_content:
+        m_var = re.search(r'(?:game_version|gameVersion|build_num)\s*[:=]\s*["\']v?([0-9]+(?:\.[0-9a-zA-Z_\-]+)*)["\']', html_content, re.I)
+        if m_var:
+            version = "v" + m_var.group(1).lstrip('vV')
+
     if not version:
         version = "v1.0"
 
-    # If title is empty or generic, extract from URL slug
-    if not clean_title or clean_title.lower() in ['untitled game', 'gamcore', 'game']:
-        slug = url.rstrip('/').split('/')[-1]
-        slug = re.sub(r'\.(?:html?|php)$', '', slug)
-        clean_title = slug.replace('-', '_').title()
+    # If title is empty or generic, extract from URL slug (avoiding filenames like index.html or version folders)
+    generic_titles = {
+        'untitled game', 'gamcore', 'game', 'index', 'home', 'player',
+        'play', 'default', 'fullscreen', 'adult_game', 'framework', 'webgl'
+    }
+    if not clean_title or clean_title.lower().strip() in generic_titles:
+        parsed_url = urlparse(url)
+        path_segs = [s for s in parsed_url.path.strip('/').split('/') if s]
+        slug = ""
+        # Find the segment that is the game slug (skip index.html, version folders, nf, flashes, etc.)
+        for seg in reversed(path_segs):
+            seg_clean = re.sub(r'\.(?:html?|php|aspx?)$', '', seg, flags=re.I)
+            if seg_clean.lower() in generic_titles:
+                continue
+            if re.match(r'^(?:v_?|ver_?|ch|chapter|ep|episode)[0-9_\.]*$', seg_clean, re.I):
+                continue
+            if seg_clean.lower() in ['nf', 'flashes', 'common', 'games']:
+                continue
+            slug = seg_clean
+            break
+        if slug:
+            clean_title = slug.replace('-', '_').title()
+        else:
+            clean_title = "Game"
 
     clean_title = sanitize_name(clean_title)
     folder_name = f"{clean_title}-{version}"
@@ -2619,6 +2649,263 @@ if __name__ == "__main__":
 # CLI INTERFACE WITH CUSTOM FORMATTED HELP
 # ==============================================================================
 
+class GameCompactor:
+    """Recursively discovers game directories and optimizes high-bitrate video assets via FFmpeg."""
+
+    @staticmethod
+    def is_ffmpeg_available():
+        try:
+            res = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
+            return res.returncode == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def get_directory_size(dir_path):
+        total = 0
+        for root, dirs, files in os.walk(dir_path):
+            for f in files:
+                p = os.path.join(root, f)
+                try:
+                    total += os.path.getsize(p)
+                except OSError:
+                    pass
+        return total
+
+    @classmethod
+    def get_video_info(cls, file_path):
+        cmd = [
+            'ffprobe', '-v', 'quiet',
+            '-print_format', 'json',
+            '-show_format', '-show_streams',
+            str(file_path)
+        ]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if res.returncode != 0:
+                return None
+            data = json.loads(res.stdout)
+            v_stream = next((s for s in data.get('streams', []) if s.get('codec_type') == 'video'), None)
+            if not v_stream:
+                return None
+
+            bitrate = int(data.get('format', {}).get('bit_rate', 0)) // 1000
+            if bitrate == 0 and v_stream.get('bit_rate'):
+                bitrate = int(v_stream['bit_rate']) // 1000
+
+            duration = float(data.get('format', {}).get('duration', 0))
+            if bitrate == 0 and duration > 0:
+                sz_bits = os.path.getsize(file_path) * 8
+                bitrate = int(sz_bits / duration / 1000)
+
+            return {
+                'codec': v_stream.get('codec_name', '').lower(),
+                'width': int(v_stream.get('width', 0)),
+                'height': int(v_stream.get('height', 0)),
+                'bitrate_kbps': bitrate,
+                'duration': duration
+            }
+        except Exception:
+            return None
+
+    @classmethod
+    def optimize_video(cls, file_path, min_bitrate=2500):
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext not in ('.mp4', '.webm'):
+            return None
+
+        try:
+            orig_size = os.path.getsize(file_path)
+        except OSError:
+            return None
+
+        if orig_size < 500 * 1024:
+            return None
+
+        info = cls.get_video_info(file_path)
+        if not info:
+            return None
+
+        bitrate = info['bitrate_kbps']
+        codec = info['codec']
+
+        effective_thresh = min_bitrate
+        if info['height'] > 0 and info['height'] <= 720:
+            effective_thresh = int(min_bitrate * 0.7)
+
+        needs_reencode = False
+        if bitrate > effective_thresh:
+            needs_reencode = True
+        elif codec in ('vp8', 'mpeg4', 'msmpeg4v3'):
+            needs_reencode = True
+
+        if not needs_reencode:
+            return None
+
+        tmp_path = file_path + ".tmp" + ext
+
+        if ext == '.mp4':
+            ffmpeg_cmd = [
+                'ffmpeg', '-y', '-v', 'error',
+                '-i', str(file_path),
+                '-c:v', 'libx264',
+                '-crf', '23',
+                '-preset', 'veryfast',
+                '-pix_fmt', 'yuv420p',
+                '-movflags', '+faststart',
+                '-c:a', 'copy',
+                str(tmp_path)
+            ]
+        else:
+            ffmpeg_cmd = [
+                'ffmpeg', '-y', '-v', 'error',
+                '-i', str(file_path),
+                '-c:v', 'libvpx-vp9',
+                '-crf', '31',
+                '-b:v', '0',
+                '-row-mt', '1',
+                '-threads', '2',
+                '-c:a', 'copy',
+                str(tmp_path)
+            ]
+
+        try:
+            ret = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=180)
+            if ret.returncode == 0 and os.path.exists(tmp_path):
+                new_size = os.path.getsize(tmp_path)
+                if new_size < (orig_size * 0.95):
+                    os.replace(tmp_path, file_path)
+                    return orig_size - new_size
+                else:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                    return 0
+            else:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                return None
+        except Exception:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            return None
+
+    @classmethod
+    def compact_directory(cls, target_dir="downloads", max_workers=4, min_bitrate=2500):
+        if not cls.is_ffmpeg_available():
+            print("\n" + "=" * 75)
+            print(" [X] ERROR: FFmpeg is not installed or not found in system PATH.")
+            print(" [*] FFmpeg is required for the --compact feature.")
+            print(" [*] Please install FFmpeg (https://ffmpeg.org or winget install Gyan.FFmpeg) and try again.")
+            print("=" * 75)
+            return
+
+        print("\n" + "=" * 75, flush=True)
+        print(f"[*] GameGrabber Compactor: Scanning '{target_dir}' for games...", flush=True)
+        print("=" * 75, flush=True)
+
+        game_paths = GameUpdateChecker.find_game_directories(target_dir)
+        if not game_paths and GameUpdateChecker.is_game_directory(target_dir):
+            game_paths = [target_dir]
+
+        if not game_paths:
+            print(f"[*] No game installations found in '{target_dir}'.", flush=True)
+            return
+
+        print(f"[*] Discovered {len(game_paths)} game installation(s) to inspect.\n", flush=True)
+
+        total_orig_bytes = 0
+        total_saved_bytes = 0
+        total_vids_optimized = 0
+        game_summaries = []
+
+        for g_idx, game_dir in enumerate(game_paths, 1):
+            folder_name = os.path.basename(game_dir)
+            size_before = cls.get_directory_size(game_dir)
+            total_orig_bytes += size_before
+
+            # Find all videos
+            vids = []
+            for root, dirs, files in os.walk(game_dir):
+                for f in files:
+                    if f.lower().endswith(('.mp4', '.webm')):
+                        vids.append(os.path.join(root, f))
+
+            if not vids:
+                game_summaries.append({
+                    "name": folder_name,
+                    "before": size_before,
+                    "after": size_before,
+                    "saved": 0,
+                    "vids": 0
+                })
+                continue
+
+            print(f"[{g_idx}/{len(game_paths)}] Checking '{folder_name}' ({len(vids)} videos, {size_before / (1024*1024):.1f} MB)...", flush=True)
+            game_saved = 0
+            game_vids_opt = 0
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(cls.optimize_video, v, min_bitrate): v for v in vids}
+                for f in as_completed(futures):
+                    saved = f.result()
+                    if saved and saved > 0:
+                        game_saved += saved
+                        game_vids_opt += 1
+
+            size_after = cls.get_directory_size(game_dir)
+            total_saved_bytes += game_saved
+            total_vids_optimized += game_vids_opt
+
+            if game_saved > 0:
+                pct = (game_saved / size_before) * 100 if size_before else 0
+                print(f"  [+] Compressed: {size_before / (1024*1024):.1f} MB -> {size_after / (1024*1024):.1f} MB (Saved: {game_saved / (1024*1024):.1f} MB / -{pct:.1f}% | {game_vids_opt} videos)", flush=True)
+            else:
+                print(f"  [*] Already optimal ({size_after / (1024*1024):.1f} MB).", flush=True)
+
+            game_summaries.append({
+                "name": folder_name,
+                "before": size_before,
+                "after": size_after,
+                "saved": game_saved,
+                "vids": game_vids_opt
+            })
+
+        # Final Report
+        print("\n" + "=" * 80)
+        print("                  COMPACTION SUMMARY & STORAGE SAVINGS")
+        print("=" * 80)
+        print(f"{'Game Name':<38} | {'Before':>10} | {'After':>10} | {'Saved':>10} | {'Reduction':>9}")
+        print("-" * 80)
+        for s in game_summaries:
+            b_mb = s['before'] / (1024 * 1024)
+            a_mb = s['after'] / (1024 * 1024)
+            s_mb = s['saved'] / (1024 * 1024)
+            pct = (s['saved'] / s['before'] * 100) if s['before'] > 0 else 0
+            b_str = f"{b_mb:.1f} MB" if b_mb < 1024 else f"{b_mb/1024:.2f} GB"
+            a_str = f"{a_mb:.1f} MB" if a_mb < 1024 else f"{a_mb/1024:.2f} GB"
+            s_str = f"{s_mb:.1f} MB" if s_mb < 1024 else f"{s_mb/1024:.2f} GB"
+            print(f"{s['name'][:38]:<38} | {b_str:>10} | {a_str:>10} | {s_str:>10} | {pct:>8.1f}%")
+        print("-" * 80)
+
+        tot_b = total_orig_bytes / (1024 * 1024)
+        tot_a = (total_orig_bytes - total_saved_bytes) / (1024 * 1024)
+        tot_s = total_saved_bytes / (1024 * 1024)
+        tot_pct = (total_saved_bytes / total_orig_bytes * 100) if total_orig_bytes else 0
+        tot_b_str = f"{tot_b:.1f} MB" if tot_b < 1024 else f"{tot_b/1024:.2f} GB"
+        tot_a_str = f"{tot_a:.1f} MB" if tot_a < 1024 else f"{tot_a/1024:.2f} GB"
+        tot_s_str = f"{tot_s:.1f} MB" if tot_s < 1024 else f"{tot_s/1024:.2f} GB"
+        print(f"{'TOTAL':<38} | {tot_b_str:>10} | {tot_a_str:>10} | {tot_s_str:>10} | {tot_pct:>8.1f}%")
+        print(f"[*] Videos optimized: {total_vids_optimized}")
+        print("=" * 80 + "\n")
+
 class CustomHelpFormatter(argparse.RawDescriptionHelpFormatter):
     def _format_action_invocation(self, action):
         if not action.option_strings or action.nargs == 0:
@@ -2681,6 +2968,11 @@ Examples:
   # Stop after 250 MB downloaded (safe for limited data plans, resumable anytime):
   python scraper.py "https://game-portal.com/games/space-adventure" --limit 250
 
+  # Compress videos with FFmpeg across all downloaded games (or specific directory):
+  python scraper.py --compact
+  python scraper.py --compact "downloads/html"
+  python scraper.py --compact "The_DICKtator-v2.5.1"
+
   # Scrape with custom threads and proxy:
   python scraper.py "https://game-host.com/game/index.html" --threads 12 --proxy socks5://127.0.0.1:1080
 ================================================================================
@@ -2689,6 +2981,7 @@ Examples:
 
     parser.add_argument("url", nargs="?", default=None, help="Target URL (Game portal page URL or direct game iframe/CDN URL) or local downloaded game directory")
     parser.add_argument("dest", nargs="?", default=None, help="Optional custom destination directory (e.g. '.', 'advancements', 'special_downloads/here'). Overrides default 'downloads/<engine>/<name>' path.")
+    parser.add_argument("--compact", "--optimize", dest="compact", nargs="?", const="downloads", default=None, metavar="DIR", help="Recursively discovers downloaded games in DIR (defaults to 'downloads/'), re-encodes high-bitrate videos via FFmpeg, and reports before/after storage sizes and savings.")
     parser.add_argument("--update", "--check-updates", "--check-update", dest="update", action="store_true", help="Check for game updates via CDN headers, ETags, and version probing. Scans all games if no URL is given, or checks a specific game.")
     parser.add_argument("--updateall", dest="updateall", nargs="?", const="downloads", default=None, metavar="DIR", help="Recursively discovers and checks all game installations inside DIR (defaults to 'downloads/').")
     parser.add_argument("-y", "--yes", dest="auto_yes", action="store_true", help="Automatically accept update prompts and download detected updates without confirmation.")
@@ -2708,9 +3001,20 @@ Examples:
     args = parser.parse_args()
     custom_dest = args.dest if args.dest is not None else args.folder
 
-    if not args.url and not args.update and args.updateall is None:
+    if not args.url and not args.update and args.updateall is None and args.compact is None:
         parser.print_help()
         sys.exit(0)
+
+    # Handle --compact
+    if args.compact is not None:
+        target = args.compact
+        # If user passed a game name without full path
+        for cand in [target, os.path.join("downloads", "html", target), os.path.join("downloads", "renpy", target), os.path.join("downloads", target)]:
+            if os.path.isdir(cand):
+                target = cand
+                break
+        GameCompactor.compact_directory(target_dir=target, max_workers=args.threads)
+        return
 
     play_now = args.play_now or args.stream_only
 
