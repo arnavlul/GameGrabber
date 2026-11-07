@@ -50,6 +50,93 @@ CODE_EXTENSIONS = {'js', 'css', 'html', 'htm'}
 
 ALL_EXTENSIONS = MEDIA_EXTENSIONS | CODE_EXTENSIONS
 
+AUTO_AUDIO_SCRIPT = """<script id="auto-audio-manager">
+/* ==========================================================
+   Auto-Audio Focus Manager for In-Viewport Videos & Media
+   - Automatically un-mutes the active in-viewport video clip.
+   - Ensures volume is set to 1.0.
+   - Dynamically mutes background / off-screen videos.
+   - Handles modern browser autoplay policy via user interaction unlock.
+   ========================================================== */
+(function () {
+	let userInteracted = false;
+
+	function unlockAudio() {
+		if (!userInteracted) {
+			userInteracted = true;
+			updateActiveVideo();
+		}
+	}
+
+	window.addEventListener("click", unlockAudio, { passive: true, capture: true });
+	window.addEventListener("keydown", unlockAudio, { passive: true, capture: true });
+	window.addEventListener("touchstart", unlockAudio, { passive: true, capture: true });
+	window.addEventListener("pointerdown", unlockAudio, { passive: true, capture: true });
+
+	function updateActiveVideo() {
+		const videos = Array.from(document.querySelectorAll("video"));
+		if (!videos.length) return;
+
+		const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+		const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+
+		let bestVideo = null;
+		let maxVisibleArea = 0;
+
+		videos.forEach(function (v) {
+			const rect = v.getBoundingClientRect();
+			const visibleWidth = Math.max(0, Math.min(rect.right, viewportWidth) - Math.max(rect.left, 0));
+			const visibleHeight = Math.max(0, Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0));
+			const visibleArea = visibleWidth * visibleHeight;
+
+			if (visibleArea > maxVisibleArea && visibleArea > 0) {
+				maxVisibleArea = visibleArea;
+				bestVideo = v;
+			}
+		});
+
+		videos.forEach(function (v) {
+			if (v === bestVideo && maxVisibleArea > 0) {
+				if (userInteracted) {
+					v.muted = false;
+					if (v.volume === 0) v.volume = 1.0;
+				}
+			} else {
+				v.muted = true;
+			}
+		});
+	}
+
+	// SugarCube passage transition hook
+	if (window.jQuery) {
+		$(document).on(":passagedisplay.autoVideoAudio", function () {
+			setTimeout(updateActiveVideo, 50);
+			setTimeout(updateActiveVideo, 300);
+			setTimeout(updateActiveVideo, 800);
+		});
+	}
+
+	// MutationObserver for any dynamic HTML/DOM updates
+	try {
+		const observer = new MutationObserver(function () {
+			updateActiveVideo();
+		});
+		if (document.body) {
+			observer.observe(document.body, { childList: true, subtree: true });
+		} else {
+			document.addEventListener("DOMContentLoaded", function () {
+				observer.observe(document.body, { childList: true, subtree: true });
+			});
+		}
+	} catch (e) {}
+
+	setInterval(updateActiveVideo, 800);
+	window.addEventListener("scroll", updateActiveVideo, { passive: true });
+	window.addEventListener("resize", updateActiveVideo, { passive: true });
+}());
+</script>
+"""
+
 AD_DOMAINS = [
     'doubleclick', 'googlesyndication', 'adtng', 'crme7srv', 'digitalclickstime',
     '69games', 'exo-right', 'yandex', 'google-analytics', 'trafficjunky',
@@ -2348,6 +2435,16 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
         final_html = re.sub(r'\[img\[(.*?)\]\]', lambda m: m.group(0).replace('\\', '/'), final_html)
         final_html = re.sub(r'((?:src|href)=[\'"][^\'"]*?)\\(.*?[\'"])', lambda m: m.group(0).replace('\\', '/'), final_html)
 
+    # Automatically inject Auto-Audio focus manager if not already present
+    if "auto-audio-manager" not in final_html and "Auto-Audio Focus Manager" not in final_html:
+        if "</body>" in final_html:
+            final_html = final_html.replace("</body>", AUTO_AUDIO_SCRIPT + "\n</body>", 1)
+        elif "</html>" in final_html:
+            final_html = final_html.replace("</html>", AUTO_AUDIO_SCRIPT + "\n</html>", 1)
+        else:
+            final_html += "\n" + AUTO_AUDIO_SCRIPT
+        print("  [+] Injected Auto-Audio focus manager into index.html")
+
     index_path = os.path.join(target_folder, "index.html")
     with open(index_path, "w", encoding="utf-8") as f:
         f.write(final_html)
@@ -2764,6 +2861,7 @@ class GameCompactor:
                 '-crf', '31',
                 '-b:v', '0',
                 '-row-mt', '1',
+                '-cpu-used', '4',
                 '-threads', '2',
                 '-c:a', 'copy',
                 str(tmp_path)
