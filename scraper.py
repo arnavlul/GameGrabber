@@ -1849,13 +1849,38 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
         f.write("python run_game.py\n")
 
     py_runner = os.path.join(target_folder, "run_game.py")
-    with open(py_runner, "w") as f:
+    with open(py_runner, "w", encoding="utf-8") as f:
         f.write('''import os
+import sys
+import json
 import mimetypes
 import http.server
 import socketserver
 import webbrowser
 from urllib.parse import urlparse, unquote
+
+# Register essential MIME types for WebAssembly & modern engines
+mimetypes.add_type('application/wasm', '.wasm')
+mimetypes.add_type('application/octet-stream', '.data')
+mimetypes.add_type('application/zip', '.zip')
+mimetypes.add_type('application/javascript', '.js')
+mimetypes.add_type('image/webp', '.webp')
+mimetypes.add_type('video/webm', '.webm')
+mimetypes.add_type('video/mp4', '.mp4')
+
+CDN_BASE = None
+if os.path.exists('game_meta.json'):
+    try:
+        with open('game_meta.json', 'r', encoding='utf-8') as f:
+            meta = json.load(f)
+            CDN_BASE = meta.get('cdn_url') or meta.get('source_url') or meta.get('game_url')
+            if CDN_BASE and not CDN_BASE.endswith('/'):
+                if CDN_BASE.endswith('.html') or CDN_BASE.endswith('.jpg'):
+                    CDN_BASE = CDN_BASE.rsplit('/', 1)[0] + '/'
+                else:
+                    CDN_BASE += '/'
+    except Exception:
+        pass
 
 class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
     def guess_type(self, path):
@@ -1867,11 +1892,14 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
 
     def end_headers(self):
         self.send_header('Accept-Ranges', 'bytes')
+        # Crucial for Ren'Py Web SharedArrayBuffer and WASM multi-threading
+        self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
+        self.send_header('Cross-Origin-Embedder-Policy', 'credentialless')
         super().end_headers()
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        rel_path = unquote(parsed.path.replace('+', '%2B')).replace('\\', '/').lstrip('/')
+        rel_path = unquote(parsed.path.replace('+', '%2B')).replace('\\\\', '/').lstrip('/')
         if not rel_path:
             rel_path = 'index.html'
 
@@ -1881,6 +1909,18 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
         if not (canonical_local == canonical_cwd or canonical_local.startswith(canonical_cwd + os.sep)):
             self.send_error(403, "Access denied")
             return
+
+        # Auto-fetch missing progressive asset from CDN if available
+        if not os.path.isfile(local_path) and CDN_BASE and not rel_path.endswith('.html'):
+            try:
+                import requests
+                r = requests.get(CDN_BASE + rel_path, headers={'User-Agent': 'Mozilla/5.0'}, verify=False, timeout=8)
+                if r.status_code == 200:
+                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                    with open(local_path, 'wb') as f:
+                        f.write(r.content)
+            except Exception:
+                pass
 
         if not os.path.isfile(local_path):
             return super().do_GET()
@@ -1925,38 +1965,49 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
 
         return super().do_GET()
 
-import sys
-import argparse
-
 class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-parser = argparse.ArgumentParser(description="Run local game server with HTTP Range support.")
-parser.add_argument("--port", type=int, default=8080, help="Port to listen on (default: 8080)")
-parser.add_argument("--no-browser", action="store_true", help="Do not open browser automatically")
-args = parser.parse_args()
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Run local game server with HTTP Range & WebAssembly support.")
+    parser.add_argument("--port", type=int, default=8080, help="Port to listen on (default: 8080)")
+    parser.add_argument("--no-browser", action="store_true", help="Do not open browser automatically")
+    args = parser.parse_args()
 
-port = args.port
-try:
-    httpd = ThreadingTCPServer(("", port), RangeRequestHandler)
-except OSError:
-    for p in range(8081, 8100):
+    port = args.port
+    httpd = None
+    for p in range(port, port + 50):
         try:
+            httpd = ThreadingTCPServer(("", p), RangeRequestHandler)
             port = p
-            httpd = ThreadingTCPServer(("", port), RangeRequestHandler)
             break
         except OSError:
             continue
 
-print(f"Starting local game server at http://localhost:{port}/index.html ...")
-if not args.no_browser:
-    webbrowser.open(f"http://localhost:{port}/index.html")
+    if not httpd:
+        print("Error: Could not find an open port.")
+        sys.exit(1)
 
-try:
-    httpd.serve_forever()
-except KeyboardInterrupt:
-    print("\\nShutting down server...")
+    url = f"http://localhost:{port}/index.html"
+    print("=" * 60)
+    print(f"Local Game Server running at: {url}")
+    if CDN_BASE:
+        print(f"Auto-caching enabled from CDN: {CDN_BASE}")
+    print("Keep this window open while playing!")
+    print("=" * 60)
+
+    if not args.no_browser:
+        webbrowser.open(url)
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\\nShutting down server...")
+
+if __name__ == "__main__":
+    main()
 ''')
 
     print("[+] Generated 'run_game.bat' and 'run_game.py' for instant local offline play.")
