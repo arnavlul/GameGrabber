@@ -2417,11 +2417,12 @@ class GameUpdateChecker:
                         src = iframe.get('src')
                         if src.startswith('//'):
                             src = 'https:' + src
-                        portal_iframe_url = src
+                        portal_iframe_url = normalize_url(src)
             except Exception:
                 pass
 
         resolved_url = portal_iframe_url or target_url
+        resolved_url = normalize_url(resolved_url)
         clean_url = resolved_url.split('?')[0]
         if clean_url.endswith('/'):
             clean_url += 'index.html'
