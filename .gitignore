@@ -15,6 +15,7 @@ temp/
 scratch/
 completed_links.txt
 DOWNLOADED_GAMES.md
+game_catalog.json
 games_to_download.md
 *-v*/
 *.part

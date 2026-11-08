@@ -1833,6 +1833,529 @@ class OnDemandCachingServer:
         return Handler
 
 # ==============================================================================
+# GAME CATALOG & ARCHIVE MANAGER
+# ==============================================================================
+
+class GameCatalog:
+    """
+    Manages persistent game registry in 'game_catalog.json' and syncs with 'DOWNLOADED_GAMES.md'.
+    Tracks games whether active on disk, archived (files deleted to save space), or discarded.
+    Enables update checking, version detection, and re-downloading without local files.
+    """
+    CATALOG_FILE = "game_catalog.json"
+    MARKDOWN_FILE = "DOWNLOADED_GAMES.md"
+
+    @classmethod
+    def load_catalog(cls):
+        if os.path.exists(cls.CATALOG_FILE):
+            try:
+                with open(cls.CATALOG_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    @classmethod
+    def save_catalog(cls, catalog):
+        try:
+            with open(cls.CATALOG_FILE, "w", encoding="utf-8") as f:
+                json.dump(catalog, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[!] Warning: Could not save catalog: {e}")
+
+    @classmethod
+    def detect_version_from_folder(cls, folder_path):
+        """
+        Multi-layered version detection inspecting internal game files rather than just folder name:
+        1. Explicit 'game_version' / 'version' inside game_meta.json (filtering out Twine/SugarCube engine strings)
+        2. Remote CDN / Source URLs in game_meta.json (e.g. /v_1.10/, /v_0.79/, /v_ch.3/, /episode_1/)
+        3. <title> tag in index.html (e.g. 'RISEN CITY 0.3' -> 'v0.3', 'Dragon Lewd Z v1.0.3.1' -> 'v1.0.3.1')
+        4. Folder name suffix (-v1.10, -v0.79)
+        """
+        folder_name = os.path.basename(folder_path)
+
+        # 1. Inspect game_meta.json
+        meta_path = os.path.join(folder_path, "game_meta.json")
+        meta = {}
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+            except Exception:
+                pass
+
+        # Check URLs in meta for CDN version segments
+        for u_key in ["cdn_url", "source_url", "game_url"]:
+            u = meta.get(u_key)
+            if u:
+                m_v = re.search(r'/(?:v_|v|ver_?)([\d]+(?:\.[\d\w\-]+)+)/', u, re.I)
+                if m_v:
+                    return "v" + m_v.group(1).lstrip('vV')
+                m_ch = re.search(r'/(v_ch\.?[\d\w]+)/', u, re.I)
+                if m_ch:
+                    return m_ch.group(1).replace('_', '')
+                m_ep = re.search(r'/(episode_[\d\w]+)/', u, re.I)
+                if m_ep:
+                    return m_ep.group(1)
+
+        # 2. Inspect index.html <title>
+        index_path = os.path.join(folder_path, "index.html")
+        if os.path.exists(index_path):
+            try:
+                with open(index_path, "r", encoding="utf-8", errors="ignore") as f:
+                    head = f.read(30000)
+                m_title = re.search(r'<title>([^<]+)</title>', head, re.I)
+                if m_title:
+                    t = m_title.group(1).strip()
+                    m_v = re.search(r'[\(\[\{]?(?:v(?:er)?\.?\s*|build\s*|\b)([0-9]+(?:\.[0-9a-zA-Z_\-]+)+)[\)\]\}]?', t, re.I)
+                    if m_v:
+                        val = m_v.group(1)
+                        if val not in ["2.37.3", "2.36.1", "2.9.2"]:
+                            return "v" + val.lstrip('vV')
+            except Exception:
+                pass
+
+        # 3. Check folder name suffix
+        m_fv = re.search(r'-(v[0-9]+(?:\.[0-9a-zA-Z_\-]+)*)$', folder_name, re.I)
+        if m_fv:
+            return m_fv.group(1)
+
+        # 4. Check if meta had an unflagged valid version
+        v = meta.get("version")
+        if v and v not in ["2.37.3", "2.36.1", "2.9.2", "v2.9.2", "v2.10.0", "v2.12.0"]:
+            return v if v.startswith("v") else f"v{v}"
+
+        return "v1.0"
+
+    @classmethod
+    def parse_markdown_metadata(cls):
+        """Extracts existing human-entered tracking info from DOWNLOADED_GAMES.md."""
+        if not os.path.exists(cls.MARKDOWN_FILE):
+            return {}
+        try:
+            with open(cls.MARKDOWN_FILE, "r", encoding="utf-8") as f:
+                text = f.read()
+        except Exception:
+            return {}
+
+        entries = {}
+        # HTML Games table: | Game Title | Play Status | Last Downloaded | Directory | Gamcore URL | CDN Base URL |
+        html_sec = re.search(r'### HTML Games.*?(?=###|\Z)', text, re.DOTALL)
+        if html_sec:
+            for line in html_sec.group(0).splitlines():
+                if not line.startswith('|') or 'Game Title' in line or ':---' in line:
+                    continue
+                parts = [p.strip() for p in line.split('|')[1:-1]]
+                if len(parts) >= 6:
+                    title = re.sub(r'[*_]', '', parts[0]).strip()
+                    entries[title] = {
+                        "engine": "html",
+                        "status": parts[1].strip(),
+                        "last_downloaded": parts[2].strip(),
+                        "directory": parts[3].strip('` '),
+                        "gamcore_url": parts[4].strip('` '),
+                        "cdn_url": parts[5].strip('` ')
+                    }
+
+        # Ren'Py Games table: | Game Title | Last Downloaded | Directory | Gamcore URL | CDN Base URL |
+        renpy_sec = re.search(r'### Ren\'Py Games.*?(?=##|\Z)', text, re.DOTALL)
+        if renpy_sec:
+            for line in renpy_sec.group(0).splitlines():
+                if not line.startswith('|') or 'Game Title' in line or ':---' in line:
+                    continue
+                parts = [p.strip() for p in line.split('|')[1:-1]]
+                if len(parts) >= 5:
+                    title = re.sub(r'[*_]', '', parts[0]).strip()
+                    is_deleted = "deleted" in parts[1].lower()
+                    entries[title] = {
+                        "engine": "renpy",
+                        "status": "🚫 Deleted / Discarded" if is_deleted else "⏳ Unplayed",
+                        "last_downloaded": parts[1].strip(),
+                        "directory": parts[2].strip('` '),
+                        "gamcore_url": parts[3].strip('` '),
+                        "cdn_url": parts[4].strip('` ')
+                    }
+
+        # Discarded games section
+        disc_sec = re.search(r'## 🚫 Deleted / Discarded Games.*?(?=##|\Z)', text, re.DOTALL)
+        if disc_sec:
+            for line in disc_sec.group(0).splitlines():
+                m = re.match(r'\d+\.\s+\*\*([^*]+)\*\*(?:\s*\(([^)]+)\))?\s*—\s*(.*)', line)
+                if m:
+                    t = m.group(1).strip()
+                    v = m.group(2) or "v1.0"
+                    reason = m.group(3).strip()
+                    if t not in entries:
+                        entries[t] = {
+                            "status": "🚫 Deleted / Discarded",
+                            "version": v,
+                            "notes": reason
+                        }
+                    else:
+                        entries[t]["status"] = "🚫 Deleted / Discarded"
+                        entries[t]["notes"] = reason
+
+        return entries
+
+    @classmethod
+    def sync_catalog(cls, scan_dir="downloads"):
+        """
+        Scans disk and markdown to populate or refresh 'game_catalog.json'.
+        Keeps all local files completely untouched.
+        """
+        print("\n" + "=" * 80)
+        print(" GameGrabber - Catalog Synchronization")
+        print("=" * 80)
+        catalog = cls.load_catalog()
+        md_data = cls.parse_markdown_metadata()
+
+        game_paths = GameUpdateChecker.find_game_directories(scan_dir) if os.path.exists(scan_dir) else []
+        print(f"[*] Found {len(game_paths)} game folder(s) on disk.")
+        print(f"[*] Found {len(md_data)} tracked entry/entries in {cls.MARKDOWN_FILE}.\n")
+
+        # 1. Ingest active disk folders
+        for gp in game_paths:
+            folder_name = os.path.basename(gp)
+            parent = os.path.basename(os.path.dirname(gp))
+            engine = parent if parent in ["html", "renpy"] else "game"
+
+            meta_file = os.path.join(gp, "game_meta.json")
+            meta = {}
+            if os.path.exists(meta_file):
+                try:
+                    with open(meta_file, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                except Exception:
+                    pass
+
+            version = cls.detect_version_from_folder(gp)
+            raw_title = meta.get("game_name") or re.sub(r'-(v[0-9]+(?:\.[0-9a-zA-Z_\-]+)*)$', '', folder_name, flags=re.I)
+            clean_title = raw_title.replace('_', ' ').strip()
+            # If folder is Risen_City or title has numbers like RISEN CITY 0.3, normalize title
+            if "risen" in folder_name.lower():
+                clean_title = "Risen City"
+
+            # Find matching md entry
+            md_match = None
+            for md_t, md_entry in md_data.items():
+                if md_t.lower() == clean_title.lower() or folder_name.lower().startswith(md_t.lower().replace(' ', '_')) or md_t.lower().replace(' ', '_') in folder_name.lower():
+                    md_match = md_entry
+                    clean_title = md_t
+                    break
+
+            gamcore_url = (md_match.get("gamcore_url") if md_match else None) or ""
+            cdn_url = meta.get("cdn_url") or meta.get("game_url") or meta.get("source_url") or (md_match.get("cdn_url") if md_match else "") or ""
+            status = (md_match.get("status") if md_match else None) or "🎮 Active on Disk"
+
+            # Check if this folder already exists in catalog
+            key = folder_name
+            for k, ex in catalog.items():
+                if ex.get("title", "").lower() == clean_title.lower() or k.lower() == folder_name.lower():
+                    key = k
+                    break
+
+            catalog[key] = {
+                "title": clean_title,
+                "version": version,
+                "engine": engine,
+                "directory": gp.replace('\\', '/'),
+                "gamcore_url": gamcore_url,
+                "cdn_url": cdn_url,
+                "status": status if "Archived" not in status else "🎮 Active on Disk",
+                "on_disk": True,
+                "last_downloaded": (md_match.get("last_downloaded") if md_match else None) or datetime.fromtimestamp(os.path.getmtime(gp), tz=timezone.utc).strftime('%Y-%m-%d'),
+                "last_checked": datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            }
+            print(f"  [+] Synced: {clean_title:<32} ({version}) -> {gp}")
+
+        # 2. Ingest markdown-only or discarded entries not on disk
+        for md_t, md_entry in md_data.items():
+            already = False
+            for k, ex in catalog.items():
+                if ex.get("title", "").lower() == md_t.lower():
+                    already = True
+                    break
+            if not already:
+                key = md_t.replace(' ', '_')
+                catalog[key] = {
+                    "title": md_t,
+                    "version": md_entry.get("version", "v1.0"),
+                    "engine": md_entry.get("engine", "html"),
+                    "directory": md_entry.get("directory", ""),
+                    "gamcore_url": md_entry.get("gamcore_url", ""),
+                    "cdn_url": md_entry.get("cdn_url", ""),
+                    "status": md_entry.get("status", "📦 Archived (Deleted Locally)"),
+                    "on_disk": False,
+                    "last_downloaded": md_entry.get("last_downloaded", "Unknown"),
+                    "last_checked": datetime.now(timezone.utc).strftime('%Y-%m-%d')
+                }
+                print(f"  [+] Added from log: {md_t:<32} (Archived / Not on disk)")
+
+        cls.save_catalog(catalog)
+        cls.sync_markdown(catalog)
+        print("=" * 80)
+        print(f"[+] Catalog successfully synchronized! Total tracked games: {len(catalog)}")
+        print("=" * 80 + "\n")
+        return catalog
+
+    @classmethod
+    def register_game(cls, target, gamcore_url=None, cdn_url=None):
+        """
+        Explicitly registers a game into the catalog without deleting local files.
+        Can register an existing folder, or an online URL.
+        """
+        catalog = cls.load_catalog()
+
+        # Check if target is a local directory
+        local_dir = None
+        for cand in [target, os.path.join("downloads", "html", target), os.path.join("downloads", "renpy", target), os.path.join("downloads", target)]:
+            if os.path.isdir(cand):
+                local_dir = cand
+                break
+
+        if local_dir:
+            folder_name = os.path.basename(local_dir)
+            parent = os.path.basename(os.path.dirname(local_dir))
+            engine = parent if parent in ["html", "renpy"] else "html"
+            version = cls.detect_version_from_folder(local_dir)
+
+            meta_file = os.path.join(local_dir, "game_meta.json")
+            meta = {}
+            if os.path.exists(meta_file):
+                try:
+                    with open(meta_file, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                except Exception:
+                    pass
+
+            raw_title = meta.get("game_name") or re.sub(r'-(v[0-9]+(?:\.[0-9a-zA-Z_\-]+)*)$', '', folder_name, flags=re.I)
+            clean_title = raw_title.replace('_', ' ').strip()
+            g_url = gamcore_url or ""
+            c_url = cdn_url or meta.get("cdn_url") or meta.get("game_url") or meta.get("source_url") or ""
+
+            catalog[folder_name] = {
+                "title": clean_title,
+                "version": version,
+                "engine": engine,
+                "directory": local_dir.replace('\\', '/'),
+                "gamcore_url": g_url,
+                "cdn_url": c_url,
+                "status": "🎮 Active on Disk",
+                "on_disk": True,
+                "last_downloaded": datetime.fromtimestamp(os.path.getmtime(local_dir), tz=timezone.utc).strftime('%Y-%m-%d'),
+                "last_checked": datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            }
+            cls.save_catalog(catalog)
+            cls.sync_markdown(catalog)
+            print("\n" + "=" * 80)
+            print(f"[+] Successfully registered '{clean_title}' ({version}) into catalog!")
+            print(f"[*] Directory : {local_dir}")
+            print(f"[*] Status    : 🎮 Active on Disk (Files completely preserved)")
+            print("=" * 80 + "\n")
+            return
+
+        # Target is a URL
+        if target.startswith(("http://", "https://")):
+            clean_title, version, folder_name = extract_game_identity("", target)
+            g_url = target if "gamcore.com" in target.lower() else ""
+            c_url = target if "fgn.cdn" in target.lower() or "serverable" in target.lower() else ""
+
+            catalog[folder_name] = {
+                "title": clean_title.replace('_', ' '),
+                "version": version,
+                "engine": "html",
+                "directory": "",
+                "gamcore_url": g_url,
+                "cdn_url": c_url,
+                "status": "📋 Tracked (Not Downloaded)",
+                "on_disk": False,
+                "last_downloaded": "Never",
+                "last_checked": datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            }
+            cls.save_catalog(catalog)
+            cls.sync_markdown(catalog)
+            print("\n" + "=" * 80)
+            print(f"[+] Successfully registered online game '{clean_title}' ({version}) into catalog!")
+            print(f"[*] Tracked URL : {target}")
+            print(f"[*] Status      : 📋 Tracked (Not Downloaded)")
+            print("=" * 80 + "\n")
+            return
+
+        print(f"[X] Error: Could not resolve target '{target}' to a local game folder or valid URL.")
+
+    @classmethod
+    def archive_game(cls, target, auto_yes=False):
+        """
+        Saves metadata & version into catalog as Archived, then safely deletes local files to reclaim disk space.
+        """
+        catalog = cls.load_catalog()
+
+        local_dir = None
+        for cand in [target, os.path.join("downloads", "html", target), os.path.join("downloads", "renpy", target), os.path.join("downloads", target)]:
+            if os.path.isdir(cand):
+                local_dir = cand
+                break
+
+        if not local_dir:
+            print(f"[X] Error: Local game folder '{target}' not found.")
+            return
+
+        folder_name = os.path.basename(local_dir)
+        version = cls.detect_version_from_folder(local_dir)
+        dir_size = GameCompactor.get_directory_size(local_dir)
+        size_str = f"{dir_size / (1024 * 1024):.1f} MB" if dir_size < 1024 * 1024 * 1024 else f"{dir_size / (1024 * 1024 * 1024):.2f} GB"
+
+        meta_file = os.path.join(local_dir, "game_meta.json")
+        meta = {}
+        if os.path.exists(meta_file):
+            try:
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+            except Exception:
+                pass
+
+        raw_title = meta.get("game_name") or re.sub(r'-(v[0-9]+(?:\.[0-9a-zA-Z_\-]+)*)$', '', folder_name, flags=re.I)
+        clean_title = raw_title.replace('_', ' ').strip()
+
+        # Find existing catalog entry or create
+        cat_entry = catalog.get(folder_name, {})
+        gamcore_url = cat_entry.get("gamcore_url") or ""
+        cdn_url = meta.get("cdn_url") or meta.get("game_url") or meta.get("source_url") or cat_entry.get("cdn_url") or ""
+
+        # If gamcore_url is empty, check markdown
+        if not gamcore_url:
+            md_data = cls.parse_markdown_metadata()
+            for md_t, md_e in md_data.items():
+                if md_t.lower() == clean_title.lower():
+                    gamcore_url = md_e.get("gamcore_url", "")
+                    if not cdn_url:
+                        cdn_url = md_e.get("cdn_url", "")
+                    break
+
+        print("\n" + "=" * 80)
+        print(f" GameGrabber - Archive & Reclaim Storage")
+        print("=" * 80)
+        print(f"[*] Game Title       : {clean_title}")
+        print(f"[*] Detected Version : {version}")
+        print(f"[*] Local Directory  : {os.path.abspath(local_dir)}")
+        print(f"[*] Disk Space Freed : {size_str}")
+        print(f"[*] Gamcore URL      : {gamcore_url or 'N/A'}")
+        print(f"[*] Direct CDN URL   : {cdn_url or 'N/A'}")
+        print("-" * 80)
+        print("[!] All version and URL metadata will be preserved in 'game_catalog.json' & 'DOWNLOADED_GAMES.md'.")
+        print("[!] You can check updates and re-download fresh anytime with `scraper.py --updateall`.")
+        print("=" * 80)
+
+        if not auto_yes:
+            try:
+                ans = input(f"\n[?] Are you sure you want to archive '{clean_title}' and delete this folder? [y/N]: ").strip().lower()
+                if ans not in ['y', 'yes']:
+                    print("[*] Archiving cancelled by user.")
+                    return
+            except (KeyboardInterrupt, EOFError):
+                print("\n[*] Aborted.")
+                return
+
+        # Update catalog entry
+        catalog[folder_name] = {
+            "title": clean_title,
+            "version": version,
+            "engine": cat_entry.get("engine", "html"),
+            "directory": local_dir.replace('\\', '/'),
+            "gamcore_url": gamcore_url,
+            "cdn_url": cdn_url,
+            "status": "📦 Archived (Deleted Locally)",
+            "on_disk": False,
+            "last_downloaded": cat_entry.get("last_downloaded") or datetime.fromtimestamp(os.path.getmtime(local_dir), tz=timezone.utc).strftime('%Y-%m-%d'),
+            "last_checked": datetime.now(timezone.utc).strftime('%Y-%m-%d'),
+            "archived_date": datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        }
+        cls.save_catalog(catalog)
+
+        # Safely remove folder
+        try:
+            shutil.rmtree(local_dir)
+            print(f"\n[+] Successfully deleted '{local_dir}'! Freed {size_str} of disk space.")
+        except Exception as e:
+            print(f"[!] Warning: Error while deleting directory: {e}")
+
+        cls.sync_markdown(catalog)
+        print(f"[+] Catalog and {cls.MARKDOWN_FILE} updated to '📦 Archived (Deleted Locally)'.\n")
+
+    @classmethod
+    def list_catalog(cls):
+        """Displays formatted catalog table."""
+        catalog = cls.load_catalog()
+        if not catalog:
+            catalog = cls.sync_catalog()
+
+        print("\n" + "=" * 90)
+        print(f" GameGrabber - Persistent Game Catalog ({len(catalog)} Tracked Games)")
+        print("=" * 90)
+        print(f"{'Game Title':<34} | {'Version':<10} | {'Status':<28} | {'On Disk':<7}")
+        print("-" * 90)
+        for key, entry in sorted(catalog.items(), key=lambda x: (not x[1].get('on_disk', False), x[1].get('title', ''))):
+            title = entry.get("title", key)
+            ver = entry.get("version", "v1.0")
+            st = entry.get("status", "Unknown")
+            on_d = "YES" if entry.get("on_disk", False) else "NO"
+            print(f"{title[:34]:<34} | {ver:<10} | {st[:28]:<28} | {on_d:<7}")
+        print("=" * 90 + "\n")
+
+    @classmethod
+    def sync_markdown(cls, catalog=None):
+        """Regenerates or updates DOWNLOADED_GAMES.md from catalog."""
+        if catalog is None:
+            catalog = cls.load_catalog()
+        if not catalog:
+            return
+
+        lines = [
+            "# Game Library & Download Tracking\n",
+            "This document maintains a permanent log of all downloaded, archived, and tracked games in `GameGrabber`.\n",
+            f"**Last Updated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d')}  ",
+            "**Strict Preference:** Male MC (Protagonist) Only.\n",
+            "---\n",
+            "## 🚫 Deleted / Discarded Games (DO NOT RE-DOWNLOAD)\n"
+        ]
+
+        # 1. Discarded
+        disc_count = 1
+        for k, e in sorted(catalog.items(), key=lambda x: x[1].get('title', '')):
+            if "Discarded" in e.get("status", "") or "DO NOT RE-DOWNLOAD" in e.get("notes", ""):
+                reason = e.get("notes") or "Deleted by user (DO NOT RE-DOWNLOAD)"
+                lines.append(f"{disc_count}. **{e.get('title')} ({e.get('version', 'v1.0')})** — *{reason}*\n")
+                disc_count += 1
+
+        lines.extend([
+            "---\n",
+            "## 📦 Archived Games (Files Deleted to Free Space - Monitored for Updates)\n",
+            "| Game Title | Last Version | Gamcore URL | CDN Base URL | Archived Date |\n",
+            "| :--- | :---: | :--- | :--- | :---: |\n"
+        ])
+        for k, e in sorted(catalog.items(), key=lambda x: x[1].get('title', '')):
+            if "Archived" in e.get("status", ""):
+                lines.append(f"| **{e.get('title')}** | {e.get('version', 'v1.0')} | {e.get('gamcore_url') or 'N/A'} | {e.get('cdn_url') or 'N/A'} | {e.get('archived_date', e.get('last_checked', ''))} |\n")
+
+        lines.extend([
+            "---\n",
+            "## 🎮 Active Games on Disk\n",
+            "| Game Title | Version | Play Status | Directory | Gamcore URL | CDN Base URL |\n",
+            "| :--- | :---: | :---: | :--- | :--- | :--- |\n"
+        ])
+        for k, e in sorted(catalog.items(), key=lambda x: x[1].get('title', '')):
+            if e.get("on_disk", False):
+                lines.append(f"| **{e.get('title')}** | {e.get('version', 'v1.0')} | {e.get('status', '🎮 Active')} | `{e.get('directory', '')}` | {e.get('gamcore_url') or 'N/A'} | {e.get('cdn_url') or 'N/A'} |\n")
+
+        lines.append("\n---\n")
+        try:
+            with open(cls.MARKDOWN_FILE, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+        except Exception as ex:
+            print(f"[!] Warning: Could not update {cls.MARKDOWN_FILE}: {ex}")
+
+
+# ==============================================================================
 # GAME UPDATE CHECKER & CDN INTROSPECTOR
 # ==============================================================================
 
@@ -1879,6 +2402,7 @@ class GameUpdateChecker:
     @classmethod
     def check_single_url(cls, target_url, local_mtime=None, local_etag=None, verify_ssl=True):
         """Checks if a remote game URL or CDN build has an update available."""
+        target_url = normalize_url(target_url)
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
@@ -2036,15 +2560,16 @@ class GameUpdateChecker:
 
     @classmethod
     def check_all_downloaded_games(cls, target_dir="downloads", verify_ssl=True, max_workers=8):
-        """Recursively discovers all games inside target_dir and checks for updates."""
-        game_paths = cls.find_game_directories(target_dir)
-        if not game_paths:
-            print(f"[*] No game installations found inside '{target_dir}'.")
-            return []
+        """Recursively discovers all games inside target_dir and checks for updates, integrating with catalog."""
+        catalog = GameCatalog.load_catalog()
+
+        game_paths = cls.find_game_directories(target_dir) if os.path.exists(target_dir) else []
+        seen_folders = set()
 
         games_to_check = []
         for folder_path in game_paths:
             folder_name = os.path.basename(folder_path)
+            seen_folders.add(folder_name.lower())
             parent_name = os.path.basename(os.path.dirname(folder_path))
             cat = parent_name if parent_name in ["html", "renpy"] else "game"
 
@@ -2064,20 +2589,50 @@ class GameUpdateChecker:
             elif os.path.exists(meta_file):
                 local_mtime = datetime.fromtimestamp(os.path.getmtime(meta_file), tz=timezone.utc)
 
+            # Robust internal version detection
+            local_ver = GameCatalog.detect_version_from_folder(folder_path)
+
             url = meta.get("game_url") or meta.get("cdn_url") or meta.get("source_url")
+            # If no URL in folder meta, check catalog
+            if not url and folder_name in catalog:
+                url = catalog[folder_name].get("gamcore_url") or catalog[folder_name].get("cdn_url")
+
             games_to_check.append({
                 "folder": folder_name,
+                "title": catalog.get(folder_name, {}).get("title", folder_name),
                 "category": cat,
                 "path": folder_path,
                 "url": url,
-                "local_version": meta.get("version"),
+                "local_version": local_ver,
                 "local_etag": meta.get("etag"),
-                "local_mtime": local_mtime
+                "local_mtime": local_mtime,
+                "archived": False
             })
 
-        print("=" * 90)
-        print(f" Checking updates for {len(games_to_check)} game(s) in '{target_dir}'...")
-        print("=" * 90)
+        # Also check archived games from catalog that aren't on disk
+        for cat_k, cat_e in catalog.items():
+            if cat_e.get("status") and "Archived" in cat_e.get("status") and cat_k.lower() not in seen_folders:
+                c_url = cat_e.get("gamcore_url") or cat_e.get("cdn_url")
+                if c_url:
+                    games_to_check.append({
+                        "folder": cat_k,
+                        "title": cat_e.get("title", cat_k),
+                        "category": cat_e.get("engine", "archived"),
+                        "path": None,
+                        "url": c_url,
+                        "local_version": cat_e.get("version", "v1.0"),
+                        "local_etag": cat_e.get("etag"),
+                        "local_mtime": None,
+                        "archived": True
+                    })
+
+        if not games_to_check:
+            print(f"[*] No game installations found inside '{target_dir}' or catalog.")
+            return []
+
+        print("=" * 95)
+        print(f" Checking updates for {len(games_to_check)} game(s) ({len(game_paths)} active, {len(games_to_check)-len(game_paths)} archived)...")
+        print("=" * 95)
 
         def worker(game):
             res = cls.check_single_url(
@@ -2092,10 +2647,12 @@ class GameUpdateChecker:
             results = list(ex.map(worker, games_to_check))
 
         updates_found = []
-        print(f"{'Game Title':<34} | {'Type':<6} | {'Local Date':<10} | {'Status':<16} | {'Details'}")
-        print("-" * 90)
+        print(f"{'Game Title':<32} | {'Type':<8} | {'Version':<9} | {'Status':<16} | {'Details'}")
+        print("-" * 95)
         for game, res in results:
-            local_date_str = game["local_mtime"].strftime('%Y-%m-%d') if game["local_mtime"] else "Unknown"
+            ver_str = game["local_version"] or "Unknown"
+            type_str = f"📦 {game['category']}" if game["archived"] else game["category"]
+
             if res.get("has_update"):
                 status_str = "[UPDATE AVAIL]"
                 updates_found.append((game, res))
@@ -2106,18 +2663,19 @@ class GameUpdateChecker:
             else:
                 status_str = f"[{res.get('update_type', 'UNKNOWN').upper()}]"
 
-            title_trunc = game["folder"][:32] + ".." if len(game["folder"]) > 34 else game["folder"]
-            print(f"{title_trunc:<34} | {game['category']:<6} | {local_date_str:<10} | {status_str:<16} | {res.get('message', '')}")
+            disp_title = game["title"][:30] + ".." if len(game["title"]) > 32 else game["title"]
+            print(f"{disp_title:<32} | {type_str:<8} | {ver_str:<9} | {status_str:<16} | {res.get('message', '')}")
 
-        print("=" * 90)
+        print("=" * 95)
         if updates_found:
             print(f"\n[+] {len(updates_found)} game(s) have updates available:")
             for g, r in updates_found:
                 new_tgt = r.get("remote_url", g["url"])
-                print(f"    * {g['folder']} -> {r.get('message')}")
+                arch_tag = " (Archived)" if g["archived"] else ""
+                print(f"    * {g['title']}{arch_tag} [{g['local_version']}] -> {r.get('message')}")
         else:
             print("\n[+] All checked games are up to date!")
-        print("=" * 90 + "\n")
+        print("=" * 95 + "\n")
         return updates_found
 
 # ==============================================================================
@@ -2709,6 +3267,12 @@ if __name__ == "__main__":
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
 
+        # Register completed download into persistent catalog
+        try:
+            GameCatalog.register_game(target_folder, gamcore_url=url if "gamcore.com" in url.lower() else None, cdn_url=game_url)
+        except Exception:
+            pass
+
         print("=" * 75)
         print(" [+] 100% of prioritized game assets have been downloaded and cached locally! ")
         print(" [+] The game is now fully offline-playable anytime via run_game.bat. ")
@@ -3173,6 +3737,20 @@ Examples:
   python scraper.py --audio-fix "downloads/html"
   python scraper.py --audio-fix "Candid_Urban_Muffs-v0.78"
 
+  # Archive a game to reclaim disk space (keeps version and URLs in catalog, deletes local folder):
+  python scraper.py --archive "Fairytale-v1.0"
+  python scraper.py --archive "Fairytale-v1.0" -y
+
+  # Register a game in catalog WITHOUT deleting files on disk:
+  python scraper.py --register "Seven_Sins-v1.10"
+  python scraper.py --register "https://gamcore.com/games/college_daze"
+
+  # Sync all existing downloads & tracking log into game_catalog.json:
+  python scraper.py --sync-catalog
+
+  # View all tracked games and statuses in catalog:
+  python scraper.py --catalog
+
   # Scrape with custom threads and proxy:
   python scraper.py "https://game-host.com/game/index.html" --threads 12 --proxy socks5://127.0.0.1:1080
 ================================================================================
@@ -3181,6 +3759,10 @@ Examples:
 
     parser.add_argument("url", nargs="?", default=None, help="Target URL (Game portal page URL or direct game iframe/CDN URL) or local downloaded game directory")
     parser.add_argument("dest", nargs="?", default=None, help="Optional custom destination directory (e.g. '.', 'advancements', 'special_downloads/here'). Overrides default 'downloads/<engine>/<name>' path.")
+    parser.add_argument("--register", "--track", dest="register", type=str, metavar="TARGET", default=None, help="Explicitly register a game folder or online URL into the persistent catalog WITHOUT deleting local files.")
+    parser.add_argument("--archive", dest="archive", type=str, metavar="TARGET", default=None, help="Archive a game: records versions and URLs into catalog/DOWNLOADED_GAMES.md, then safely deletes local files to reclaim disk space.")
+    parser.add_argument("--sync-catalog", dest="sync_catalog", action="store_true", help="Scans existing downloads and tracking log to synchronize 'game_catalog.json' and 'DOWNLOADED_GAMES.md'.")
+    parser.add_argument("--catalog", "--list-catalog", dest="list_catalog", action="store_true", help="Display all games tracked in the persistent catalog with version, status, and disk presence.")
     parser.add_argument("--audio-fix", "--fix-audio", dest="audio_fix", nargs="?", const="downloads", default=None, metavar="DIR", help="Detect and inject Auto-Audio Focus Manager into downloaded games. Checks index.html; skips games that already have it. Scans DIR (defaults to 'downloads/'), or can be pointed to a specific game directory.")
     parser.add_argument("--compact", "--optimize", dest="compact", nargs="?", const="downloads", default=None, metavar="DIR", help="Recursively discovers downloaded games in DIR (defaults to 'downloads/'), re-encodes high-bitrate videos via FFmpeg, and reports before/after storage sizes and savings.")
     parser.add_argument("--update", "--check-updates", "--check-update", dest="update", action="store_true", help="Check for game updates via CDN headers, ETags, and version probing. Scans all games if no URL is given, or checks a specific game.")
@@ -3202,9 +3784,29 @@ Examples:
     args = parser.parse_args()
     custom_dest = args.dest if args.dest is not None else args.folder
 
-    if not args.url and not args.update and args.updateall is None and args.compact is None and args.audio_fix is None:
+    if not args.url and not args.update and args.updateall is None and args.compact is None and args.audio_fix is None and not args.sync_catalog and not args.list_catalog and args.archive is None and args.register is None:
         parser.print_help()
         sys.exit(0)
+
+    # Handle --sync-catalog
+    if args.sync_catalog:
+        GameCatalog.sync_catalog()
+        return
+
+    # Handle --catalog / --list-catalog
+    if args.list_catalog:
+        GameCatalog.list_catalog()
+        return
+
+    # Handle --register
+    if args.register:
+        GameCatalog.register_game(args.register)
+        return
+
+    # Handle --archive
+    if args.archive:
+        GameCatalog.archive_game(args.archive, auto_yes=args.auto_yes)
+        return
 
     # Handle --audio-fix
     if args.audio_fix is not None:
@@ -3305,12 +3907,24 @@ Examples:
             elif os.path.exists(meta_file):
                 local_mtime = datetime.fromtimestamp(os.path.getmtime(meta_file), tz=timezone.utc)
 
+        # If not found on disk, check if it's an archived game in catalog
+        catalog = GameCatalog.load_catalog()
+        cat_match = None
+        if not local_path:
+            for k, e in catalog.items():
+                if k.lower() == target.lower() or e.get("title", "").lower() == target.lower():
+                    cat_match = e
+                    remote_url = e.get("gamcore_url") or e.get("cdn_url") or target
+                    break
+
         print("=" * 80)
         print(" GameGrabber - Update Verification")
         print("=" * 80)
         print(f"[*] Target             : {target}")
         if local_path:
             print(f"[*] Local Installation : {os.path.abspath(local_path)}")
+        elif cat_match:
+            print(f"[*] Catalog Status     : {cat_match.get('status')} [Version: {cat_match.get('version')}]")
         print(f"[*] Remote Origin URL  : {remote_url}")
 
         res = GameUpdateChecker.check_single_url(

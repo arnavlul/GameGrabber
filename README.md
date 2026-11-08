@@ -162,6 +162,33 @@ python scraper.py --audio-fix "downloads/renpy"
 python scraper.py --audio-fix "Candid_Urban_Muffs-v1.0"
 ```
 
+### 9. Persistent Game Catalog & Reclaiming Storage (`--archive`, `--register`, `--catalog`)
+When downloading heavy games, local storage can fill up quickly. GameGrabber includes a persistent catalog system (`game_catalog.json` synced with `DOWNLOADED_GAMES.md`) that preserves all game titles, internal versions, Gamcore portal links, and origin CDN URLs even after local files are deleted:
+
+* **Internal Version Detection:** Detects true game versions by inspecting internal files (`game_meta.json`, CDN URL paths, `index.html` `<title>`), so renamed folders never lose their real version.
+* **Archive & Free Space (`--archive`):** Backs up all version and link metadata to the catalog, marks the game as `📦 Archived`, prompts for confirmation, and safely deletes the folder to free disk space.
+* **Register Without Deleting (`--register` / `--sync-catalog`):** Add downloaded games or online URLs to the catalog without touching or deleting any local files.
+* **Offline Update Checks (`--updateall` / `--update`):** `--updateall` automatically checks both active downloads AND archived games against remote CDNs. When a new version is released for an archived game, it notifies you and lets you download it fresh!
+
+```bash
+# View all tracked games in the catalog (versions, statuses, disk presence):
+python scraper.py --catalog
+
+# Synchronize all current downloads & markdown tracking logs into the catalog:
+python scraper.py --sync-catalog
+
+# Explicitly register a downloaded game or online URL into the catalog (keeps local files intact):
+python scraper.py --register "Seven_Sins-v1.10"
+python scraper.py --register "https://gamcore.com/games/college_daze"
+
+# Archive a finished or heavy game to reclaim gigabytes of disk space:
+python scraper.py --archive "Fairytale-v1.0"
+python scraper.py --archive "Fairytale-v1.0" -y
+
+# Check for updates on an archived game (even if not on disk):
+python scraper.py "Fairytale" --update
+```
+
 ---
 
 ## 📖 CLI Reference (`--help`)
