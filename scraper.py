@@ -3004,6 +3004,103 @@ class GameCompactor:
         print(f"[*] Videos optimized: {total_vids_optimized}")
         print("=" * 80 + "\n")
 
+class GameAudioFixer:
+    """Recursively discovers game directories, inspects index.html, and injects Auto-Audio Focus Manager if missing."""
+
+    @classmethod
+    def fix_game(cls, game_dir):
+        """
+        Inspects index.html in game_dir.
+        Returns:
+            ("injected", message) if injected
+            ("skipped", message) if already present
+            ("no_html", message) if index.html is missing
+            ("error", message) if read/write failed
+        """
+        index_path = os.path.join(game_dir, "index.html")
+        if not os.path.exists(index_path):
+            return "no_html", "No index.html found"
+
+        try:
+            with open(index_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return "error", f"Read error: {e}"
+
+        # Detection check: skip if auto-audio script or manager is already present
+        if "auto-audio-manager" in content or "Auto-Audio Focus Manager" in content:
+            return "skipped", "Already present"
+
+        # Inject AUTO_AUDIO_SCRIPT before </body>, </html>, or at EOF
+        if "</body>" in content:
+            updated = content.replace("</body>", AUTO_AUDIO_SCRIPT + "\n</body>", 1)
+        elif "</html>" in content:
+            updated = content.replace("</html>", AUTO_AUDIO_SCRIPT + "\n</html>", 1)
+        else:
+            updated = content + "\n" + AUTO_AUDIO_SCRIPT
+
+        try:
+            with open(index_path, "w", encoding="utf-8") as f:
+                f.write(updated)
+            return "injected", "Injected successfully"
+        except Exception as e:
+            return "error", f"Write error: {e}"
+
+    @classmethod
+    def fix_directory(cls, target_dir="downloads"):
+        print("\n" + "=" * 80)
+        print(" GameGrabber - Auto-Audio Focus Manager Injector & Detector")
+        print("=" * 80)
+        print(f"[*] Scanning '{target_dir}' for downloaded games...\n")
+
+        # Resolve target if single folder passed
+        for cand in [
+            target_dir,
+            os.path.join("downloads", "html", target_dir),
+            os.path.join("downloads", "renpy", target_dir),
+            os.path.join("downloads", target_dir)
+        ]:
+            if os.path.isdir(cand):
+                target_dir = cand
+                break
+
+        game_paths = GameUpdateChecker.find_game_directories(target_dir)
+        if not game_paths and GameUpdateChecker.is_game_directory(target_dir):
+            game_paths = [target_dir]
+
+        if not game_paths:
+            print(f"[*] No game installations found in '{target_dir}'.")
+            return
+
+        print(f"[*] Discovered {len(game_paths)} game installation(s) to inspect.\n")
+
+        counts = {"injected": 0, "skipped": 0, "no_html": 0, "error": 0}
+
+        for p in game_paths:
+            name = os.path.basename(p)
+            status, msg = cls.fix_game(p)
+            counts[status] = counts.get(status, 0) + 1
+            if status == "injected":
+                print(f"  [+] {name:<45} -> Injected Auto-Audio Manager")
+            elif status == "skipped":
+                print(f"  [=] {name:<45} -> Already has Auto-Audio (Skipped)")
+            elif status == "no_html":
+                print(f"  [-] {name:<45} -> No index.html found (Skipped)")
+            else:
+                print(f"  [!] {name:<45} -> Error: {msg}")
+
+        print("\n" + "=" * 80)
+        print("                   AUTO-AUDIO INJECTION SUMMARY")
+        print("=" * 80)
+        print(f"[*] Total Games Inspected : {len(game_paths)}")
+        print(f"[+] Newly Injected        : {counts['injected']}")
+        print(f"[=] Already Protected     : {counts['skipped']}")
+        if counts['no_html'] > 0:
+            print(f"[-] Missing index.html    : {counts['no_html']}")
+        if counts['error'] > 0:
+            print(f"[!] Errors Encountered    : {counts['error']}")
+        print("=" * 80 + "\n")
+
 class CustomHelpFormatter(argparse.RawDescriptionHelpFormatter):
     def _format_action_invocation(self, action):
         if not action.option_strings or action.nargs == 0:
@@ -3071,6 +3168,11 @@ Examples:
   python scraper.py --compact "downloads/html"
   python scraper.py --compact "The_DICKtator-v2.5.1"
 
+  # Detect and inject Auto-Audio focus manager across all games (or specific game/dir):
+  python scraper.py --audio-fix
+  python scraper.py --audio-fix "downloads/html"
+  python scraper.py --audio-fix "Candid_Urban_Muffs-v0.78"
+
   # Scrape with custom threads and proxy:
   python scraper.py "https://game-host.com/game/index.html" --threads 12 --proxy socks5://127.0.0.1:1080
 ================================================================================
@@ -3079,6 +3181,7 @@ Examples:
 
     parser.add_argument("url", nargs="?", default=None, help="Target URL (Game portal page URL or direct game iframe/CDN URL) or local downloaded game directory")
     parser.add_argument("dest", nargs="?", default=None, help="Optional custom destination directory (e.g. '.', 'advancements', 'special_downloads/here'). Overrides default 'downloads/<engine>/<name>' path.")
+    parser.add_argument("--audio-fix", "--fix-audio", dest="audio_fix", nargs="?", const="downloads", default=None, metavar="DIR", help="Detect and inject Auto-Audio Focus Manager into downloaded games. Checks index.html; skips games that already have it. Scans DIR (defaults to 'downloads/'), or can be pointed to a specific game directory.")
     parser.add_argument("--compact", "--optimize", dest="compact", nargs="?", const="downloads", default=None, metavar="DIR", help="Recursively discovers downloaded games in DIR (defaults to 'downloads/'), re-encodes high-bitrate videos via FFmpeg, and reports before/after storage sizes and savings.")
     parser.add_argument("--update", "--check-updates", "--check-update", dest="update", action="store_true", help="Check for game updates via CDN headers, ETags, and version probing. Scans all games if no URL is given, or checks a specific game.")
     parser.add_argument("--updateall", dest="updateall", nargs="?", const="downloads", default=None, metavar="DIR", help="Recursively discovers and checks all game installations inside DIR (defaults to 'downloads/').")
@@ -3099,9 +3202,14 @@ Examples:
     args = parser.parse_args()
     custom_dest = args.dest if args.dest is not None else args.folder
 
-    if not args.url and not args.update and args.updateall is None and args.compact is None:
+    if not args.url and not args.update and args.updateall is None and args.compact is None and args.audio_fix is None:
         parser.print_help()
         sys.exit(0)
+
+    # Handle --audio-fix
+    if args.audio_fix is not None:
+        GameAudioFixer.fix_directory(target_dir=args.audio_fix)
+        return
 
     # Handle --compact
     if args.compact is not None:

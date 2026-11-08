@@ -20,6 +20,7 @@ Universal browser game downloader and offline player. Download, archive, and pre
   - `--limit <MB>`: Caps total transferred data to a specific quota; safe for limited mobile hotspots or Wi-Fi.
   - `--no-videos`: Downloads all story dialogue, audio, and images while skipping large video files.
 - **Instant Offline Runners:** Automatically writes `run_game.bat` and `run_game.py` (an RFC 7233 compliant multithreaded Range server) into the output directory for smooth seeking and playback.
+- **Auto-Audio Focus Manager (`--audio-fix`):** Engine-agnostic viewport audio manager that un-mutes visible on-screen HTML5 video cutscenes, unlocks modern browser autoplay policies on first user interaction, sets volume to 1.0, and mutes off-screen media. Automatically injected into `index.html` on download and retroactively verifiable across your game library via `--audio-fix`.
 - **Lightweight Update Detection (`--update` & `--updateall`):** Check for newer versions and game patches in seconds using lightweight HTTP HEAD requests, ETag comparisons, Last-Modified timestamps, and intelligent CDN version probing without downloading heavy media files.
 - **Cryptographic Differential Updates & Rename Reuse (`--diff`):** Uses RFC 7232 HTTP Conditional Requests (`If-None-Match` $\rightarrow$ `304 Not Modified`) to verify existing assets in a single network round-trip with zero bytes transferred. Automatically seeds assets via hardlinks, maintains a persistent asset manifest in `game_meta.json`, and detects renamed assets via exact MD5 ETag matches with 0% error.
 
@@ -139,6 +140,28 @@ python scraper.py --compact "downloads/html"
 python scraper.py --compact "The_DICKtator-v2.5.1"
 ```
 
+### 8. Auto-Audio Focus Manager & Retroactive Fix (`--audio-fix`)
+Modern browsers restrict unmuted autoplay for video elements without prior user interaction. Many web games also embed multiple video elements in the DOM (e.g. background loops or off-screen preloads) or leave clips muted by default.
+
+GameGrabber automatically injects the **Auto-Audio Focus Manager** into `index.html` during download:
+* **Viewport Focus Detection:** Continuously measures the visible on-screen bounding box (`getBoundingClientRect`) of all `<video>` tags and un-mutes only the primary active scene.
+* **Volume Maximization:** Automatically sets the active video's volume to `1.0`.
+* **Cacophony Prevention:** Keeps background and off-screen videos muted so overlapping audio tracks never clash.
+* **Engine Agnostic:** Works across Twine / SugarCube, Ren'Py Web, RPG Maker, Construct, and generic HTML5 canvas. Hooks `:passagedisplay` transitions and `MutationObserver` DOM updates.
+* **Duplicate Detection:** Checks if `auto-audio-manager` is already present before injecting, guaranteeing safe idempotency without double listeners.
+
+```bash
+# Recursively scan downloads/ and inject Auto-Audio manager into any game missing it:
+python scraper.py --audio-fix
+
+# Scan a specific category:
+python scraper.py --audio-fix "downloads/html"
+python scraper.py --audio-fix "downloads/renpy"
+
+# Scan or fix a specific game folder:
+python scraper.py --audio-fix "Candid_Urban_Muffs-v1.0"
+```
+
 ---
 
 ## 📖 CLI Reference (`--help`)
@@ -157,6 +180,14 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
+  --audio-fix, --fix-audio [DIR]
+                        Detect and inject Auto-Audio Focus Manager into downloaded games.
+                        Checks index.html; skips games that already have it. Scans DIR
+                        (defaults to 'downloads/'), or can be pointed to a specific game directory.
+  --compact, --optimize [DIR]
+                        Recursively discovers downloaded games in DIR (defaults to 'downloads/'),
+                        re-encodes high-bitrate videos via FFmpeg, and reports before/after storage
+                        sizes and savings.
   --update, --check-updates
                         Check for game updates via CDN headers, ETags, and version probing.
                         Scans all games if no URL is provided, or checks a specific game
