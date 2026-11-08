@@ -140,18 +140,19 @@ python scraper.py --compact "downloads/html"
 python scraper.py --compact "The_DICKtator-v2.5.1"
 ```
 
-### 8. Auto-Audio Focus Manager & Retroactive Fix (`--audio-fix`)
-Modern browsers restrict unmuted autoplay for video elements without prior user interaction. Many web games also embed multiple video elements in the DOM (e.g. background loops or off-screen preloads) or leave clips muted by default.
+### 8. Auto-Audio & In-Viewport Playback Manager (`--audio-fix`)
+Modern browsers restrict unmuted autoplay for video elements without prior user interaction. Many web games embed multiple video elements in the DOM (e.g. background loops or off-screen preloads) or leave clips muted by default, causing videos to silently play through on mute even before you scroll down to them.
 
-GameGrabber automatically injects the **Auto-Audio Focus Manager** into `index.html` during download:
-* **Viewport Focus Detection:** Continuously measures the visible on-screen bounding box (`getBoundingClientRect`) of all `<video>` tags and un-mutes only the primary active scene.
-* **Volume Maximization:** Automatically sets the active video's volume to `1.0`.
-* **Cacophony Prevention:** Keeps background and off-screen videos muted so overlapping audio tracks never clash.
+GameGrabber automatically injects the **In-Viewport Playback & Auto-Audio Manager** into `index.html` during download:
+* **Strict In-Viewport Playback:** Videos **only play when in view with audio** and **stay paused and muted when out of view**. Prevents background videos from silently playing through while off-screen.
+* **Volume Maximization & Unmute:** Automatically un-mutes in-viewport video clips and maximizes volume to `1.0`.
+* **Zero Cacophony:** Automatically pauses off-screen videos when scrolling past them, and seamlessly resumes/starts the active video when it enters the viewport.
+* **Autoplay Policy Unlock:** Intercepts browser autoplay restrictions on the user's first interaction (`click`, `keydown`, `touchstart`), instantly starting in-view videos with full sound.
 * **Engine Agnostic:** Works across Twine / SugarCube, Ren'Py Web, RPG Maker, Construct, and generic HTML5 canvas. Hooks `:passagedisplay` transitions and `MutationObserver` DOM updates.
-* **Duplicate Detection:** Checks if `auto-audio-manager` is already present before injecting, guaranteeing safe idempotency without double listeners.
+* **Automatic Upgrade:** Checks and upgrades older scripts across your existing game library via `--audio-fix`.
 
 ```bash
-# Recursively scan downloads/ and inject Auto-Audio manager into any game missing it:
+# Recursively scan downloads/ and inject/upgrade in-viewport audio manager across all games:
 python scraper.py --audio-fix
 
 # Scan a specific category:

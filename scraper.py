@@ -52,14 +52,15 @@ ALL_EXTENSIONS = MEDIA_EXTENSIONS | CODE_EXTENSIONS
 
 AUTO_AUDIO_SCRIPT = """<script id="auto-audio-manager">
 /* ==========================================================
-   Auto-Audio Focus Manager for In-Viewport Videos & Media
-   - Automatically un-mutes the active in-viewport video clip.
-   - Ensures volume is set to 1.0.
-   - Dynamically mutes background / off-screen videos.
+   Auto-Audio & In-Viewport Playback Manager
+   - Ensures videos only play when in viewport with audio.
+   - Automatically pauses and mutes videos when out of view.
+   - Prevents silent background playback on mute.
    - Handles modern browser autoplay policy via user interaction unlock.
    ========================================================== */
 (function () {
 	let userInteracted = false;
+	let activeVideo = null;
 
 	function unlockAudio() {
 		if (!userInteracted) {
@@ -73,35 +74,79 @@ AUTO_AUDIO_SCRIPT = """<script id="auto-audio-manager">
 	window.addEventListener("touchstart", unlockAudio, { passive: true, capture: true });
 	window.addEventListener("pointerdown", unlockAudio, { passive: true, capture: true });
 
+	function getVisibleArea(v) {
+		if (!v || v.nodeType !== 1) return 0;
+		const rect = v.getBoundingClientRect();
+		const vh = window.innerHeight || document.documentElement.clientHeight;
+		const vw = window.innerWidth || document.documentElement.clientWidth;
+		if (rect.width <= 0 || rect.height <= 0) return 0;
+		const visibleWidth = Math.max(0, Math.min(rect.right, vw) - Math.max(rect.left, 0));
+		const visibleHeight = Math.max(0, Math.min(rect.bottom, vh) - Math.max(rect.top, 0));
+		if (visibleWidth < 40 || visibleHeight < 40) return 0;
+		return visibleWidth * visibleHeight;
+	}
+
 	function updateActiveVideo() {
 		const videos = Array.from(document.querySelectorAll("video"));
-		if (!videos.length) return;
-
-		const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
-		const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+		if (!videos.length) {
+			activeVideo = null;
+			return;
+		}
 
 		let bestVideo = null;
 		let maxVisibleArea = 0;
 
 		videos.forEach(function (v) {
-			const rect = v.getBoundingClientRect();
-			const visibleWidth = Math.max(0, Math.min(rect.right, viewportWidth) - Math.max(rect.left, 0));
-			const visibleHeight = Math.max(0, Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0));
-			const visibleArea = visibleWidth * visibleHeight;
+			if (!v._autoAudioHooked) {
+				v._autoAudioHooked = true;
+				v.addEventListener("play", function () {
+					if (v !== activeVideo) {
+						const area = getVisibleArea(v);
+						if (area <= 0) {
+							v.pause();
+							v.muted = true;
+						}
+					}
+				});
+			}
 
-			if (visibleArea > maxVisibleArea && visibleArea > 0) {
+			const visibleArea = getVisibleArea(v);
+			if (visibleArea > maxVisibleArea) {
 				maxVisibleArea = visibleArea;
 				bestVideo = v;
 			}
 		});
 
+		activeVideo = maxVisibleArea > 0 ? bestVideo : null;
+
 		videos.forEach(function (v) {
-			if (v === bestVideo && maxVisibleArea > 0) {
+			if (v === activeVideo) {
+				// Video is in view: ensure audio is on
+				v.muted = false;
+				if (v.volume === 0) v.volume = 1.0;
+
 				if (userInteracted) {
-					v.muted = false;
-					if (v.volume === 0) v.volume = 1.0;
+					if (v.paused) {
+						var playPromise = v.play();
+						if (playPromise && playPromise.catch) {
+							playPromise.catch(function () {});
+						}
+					}
+				} else {
+					// Attempt unmuted play before interaction
+					var p = v.play();
+					if (p && p.catch) {
+						p.catch(function () {
+							// Browser blocked unmuted autoplay: wait paused until interaction
+							if (!v.paused) v.pause();
+						});
+					}
 				}
 			} else {
+				// Out of view: MUST STAY PAUSED and muted
+				if (!v.paused) {
+					v.pause();
+				}
 				v.muted = true;
 			}
 		});
@@ -111,26 +156,42 @@ AUTO_AUDIO_SCRIPT = """<script id="auto-audio-manager">
 	if (window.jQuery) {
 		$(document).on(":passagedisplay.autoVideoAudio", function () {
 			setTimeout(updateActiveVideo, 50);
-			setTimeout(updateActiveVideo, 300);
-			setTimeout(updateActiveVideo, 800);
+			setTimeout(updateActiveVideo, 250);
+			setTimeout(updateActiveVideo, 700);
 		});
 	}
 
 	// MutationObserver for any dynamic HTML/DOM updates
 	try {
-		const observer = new MutationObserver(function () {
+		const observer = new MutationObserver(function (mutations) {
+			mutations.forEach(function (m) {
+				m.addedNodes.forEach(function (node) {
+					if (node.nodeType === 1) {
+						const vids = node.tagName === "VIDEO" ? [node] : Array.from(node.querySelectorAll ? node.querySelectorAll("video") : []);
+						vids.forEach(function (v) {
+							if (getVisibleArea(v) <= 0) {
+								v.removeAttribute("autoplay");
+								if (!v.paused) v.pause();
+								v.muted = true;
+							}
+						});
+					}
+				});
+			});
 			updateActiveVideo();
 		});
-		if (document.body) {
-			observer.observe(document.body, { childList: true, subtree: true });
+
+		const targetNode = document.body || document.documentElement;
+		if (targetNode) {
+			observer.observe(targetNode, { childList: true, subtree: true });
 		} else {
 			document.addEventListener("DOMContentLoaded", function () {
-				observer.observe(document.body, { childList: true, subtree: true });
+				observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
 			});
 		}
 	} catch (e) {}
 
-	setInterval(updateActiveVideo, 800);
+	setInterval(updateActiveVideo, 500);
 	window.addEventListener("scroll", updateActiveVideo, { passive: true });
 	window.addEventListener("resize", updateActiveVideo, { passive: true });
 }());
@@ -2994,15 +3055,18 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
         final_html = re.sub(r'\[img\[(.*?)\]\]', lambda m: m.group(0).replace('\\', '/'), final_html)
         final_html = re.sub(r'((?:src|href)=[\'"][^\'"]*?)\\(.*?[\'"])', lambda m: m.group(0).replace('\\', '/'), final_html)
 
-    # Automatically inject Auto-Audio focus manager if not already present
-    if "auto-audio-manager" not in final_html and "Auto-Audio Focus Manager" not in final_html:
+    # Automatically inject or update Auto-Audio in-viewport focus manager
+    if "auto-audio-manager" in final_html:
+        final_html = re.sub(r'<script\s+id=["\']auto-audio-manager["\']>.*?</script>', AUTO_AUDIO_SCRIPT.strip(), final_html, flags=re.DOTALL)
+        print("  [+] Updated Auto-Audio in-viewport focus manager in index.html")
+    else:
         if "</body>" in final_html:
             final_html = final_html.replace("</body>", AUTO_AUDIO_SCRIPT + "\n</body>", 1)
         elif "</html>" in final_html:
             final_html = final_html.replace("</html>", AUTO_AUDIO_SCRIPT + "\n</html>", 1)
         else:
             final_html += "\n" + AUTO_AUDIO_SCRIPT
-        print("  [+] Injected Auto-Audio focus manager into index.html")
+        print("  [+] Injected Auto-Audio in-viewport focus manager into index.html")
 
     index_path = os.path.join(target_folder, "index.html")
     with open(index_path, "w", encoding="utf-8") as f:
@@ -3570,7 +3634,7 @@ class GameCompactor:
         print("=" * 80 + "\n")
 
 class GameAudioFixer:
-    """Recursively discovers game directories, inspects index.html, and injects Auto-Audio Focus Manager if missing."""
+    """Recursively discovers game directories, inspects index.html, and injects/upgrades Auto-Audio Focus Manager."""
 
     @classmethod
     def fix_game(cls, game_dir):
@@ -3578,6 +3642,7 @@ class GameAudioFixer:
         Inspects index.html in game_dir.
         Returns:
             ("injected", message) if injected
+            ("updated", message) if upgraded from previous version
             ("skipped", message) if already present
             ("no_html", message) if index.html is missing
             ("error", message) if read/write failed
@@ -3592,11 +3657,25 @@ class GameAudioFixer:
         except Exception as e:
             return "error", f"Read error: {e}"
 
-        # Detection check: skip if auto-audio script or manager is already present
-        if "auto-audio-manager" in content or "Auto-Audio Focus Manager" in content:
-            return "skipped", "Already present"
+        # If auto-audio-manager is already present in content:
+        if "auto-audio-manager" in content:
+            updated = re.sub(
+                r'<script\s+id=["\']auto-audio-manager["\']>.*?</script>',
+                AUTO_AUDIO_SCRIPT.strip(),
+                content,
+                flags=re.DOTALL
+            )
+            if updated != content:
+                try:
+                    with open(index_path, "w", encoding="utf-8") as f:
+                        f.write(updated)
+                    return "updated", "Upgraded to In-Viewport Pause & Audio Manager"
+                except Exception as e:
+                    return "error", f"Write error: {e}"
+            else:
+                return "skipped", "Already up to date"
 
-        # Inject AUTO_AUDIO_SCRIPT before </body>, </html>, or at EOF
+        # Not present: inject before </body>, </html>, or at EOF
         if "</body>" in content:
             updated = content.replace("</body>", AUTO_AUDIO_SCRIPT + "\n</body>", 1)
         elif "</html>" in content:
@@ -3614,7 +3693,7 @@ class GameAudioFixer:
     @classmethod
     def fix_directory(cls, target_dir="downloads"):
         print("\n" + "=" * 80)
-        print(" GameGrabber - Auto-Audio Focus Manager Injector & Detector")
+        print(" GameGrabber - Auto-Audio & In-Viewport Playback Manager Injector")
         print("=" * 80)
         print(f"[*] Scanning '{target_dir}' for downloaded games...\n")
 
@@ -3639,16 +3718,18 @@ class GameAudioFixer:
 
         print(f"[*] Discovered {len(game_paths)} game installation(s) to inspect.\n")
 
-        counts = {"injected": 0, "skipped": 0, "no_html": 0, "error": 0}
+        counts = {"injected": 0, "updated": 0, "skipped": 0, "no_html": 0, "error": 0}
 
         for p in game_paths:
             name = os.path.basename(p)
             status, msg = cls.fix_game(p)
             counts[status] = counts.get(status, 0) + 1
             if status == "injected":
-                print(f"  [+] {name:<45} -> Injected Auto-Audio Manager")
+                print(f"  [+] {name:<45} -> Injected In-Viewport Audio Manager")
+            elif status == "updated":
+                print(f"  [+] {name:<45} -> Upgraded to In-Viewport Pause & Audio Manager")
             elif status == "skipped":
-                print(f"  [=] {name:<45} -> Already has Auto-Audio (Skipped)")
+                print(f"  [=] {name:<45} -> Already Up to Date (Skipped)")
             elif status == "no_html":
                 print(f"  [-] {name:<45} -> No index.html found (Skipped)")
             else:
@@ -3659,11 +3740,13 @@ class GameAudioFixer:
         print("=" * 80)
         print(f"[*] Total Games Inspected : {len(game_paths)}")
         print(f"[+] Newly Injected        : {counts['injected']}")
-        print(f"[=] Already Protected     : {counts['skipped']}")
+        print(f"[^] Upgraded              : {counts['updated']}")
+        print(f"[=] Already Up to Date    : {counts['skipped']}")
         if counts['no_html'] > 0:
             print(f"[-] Missing index.html    : {counts['no_html']}")
         if counts['error'] > 0:
             print(f"[!] Errors Encountered    : {counts['error']}")
+        print("=" * 80 + "\n")
         print("=" * 80 + "\n")
 
 class CustomHelpFormatter(argparse.RawDescriptionHelpFormatter):
