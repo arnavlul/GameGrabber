@@ -3915,7 +3915,7 @@ Examples:
             for k, e in catalog.items():
                 if k.lower() == target.lower() or e.get("title", "").lower() == target.lower():
                     cat_match = e
-                    remote_url = e.get("gamcore_url") or e.get("cdn_url") or target
+                    remote_url = e.get("cdn_url") or e.get("gamcore_url") or target
                     break
 
         print("=" * 80)
