@@ -250,6 +250,25 @@ def normalize_url(raw_url):
 
     return raw
 
+def parse_version_tuple(v_str):
+    """Parses a version string like 'v1.10', 'v_3.1', 'v0.05', 'vch.3' into a comparable tuple."""
+    if not v_str:
+        return ()
+    clean = re.sub(r'^[vV_]+', '', str(v_str).strip())
+    parts = []
+    for token in re.split(r'[\.\-_]', clean):
+        if token.isdigit():
+            parts.append(int(token))
+        else:
+            m = re.search(r'\d+', token)
+            if m:
+                prefix = token[:m.start()]
+                num = int(m.group(0))
+                parts.extend([prefix, num])
+            else:
+                parts.append(token)
+    return tuple(parts)
+
 def clean_mojibake(text: str) -> str:
     """
     Detects and fixes UTF-8 -> Latin-1 mojibake (e.g. 'â€™' -> '’', 'Î¡' -> '\ue821', etc.)
@@ -2403,6 +2422,10 @@ class GameCatalog:
                     t = m.group(1).strip()
                     v = m.group(2) or "v1.0"
                     reason = m.group(3).strip()
+                    m_v_in_t = re.search(r'\s*\((v[0-9]+(?:\.[0-9a-zA-Z_\-]+)*)\)$', t, re.I)
+                    if m_v_in_t:
+                        v = m_v_in_t.group(1)
+                        t = t[:m_v_in_t.start()].strip()
                     if t not in entries:
                         entries[t] = {
                             "status": "🚫 Deleted / Discarded",
@@ -2465,10 +2488,10 @@ class GameCatalog:
             cdn_url = meta.get("cdn_url") or meta.get("game_url") or meta.get("source_url") or (md_match.get("cdn_url") if md_match else "") or ""
             status = (md_match.get("status") if md_match else None) or "🎮 Active on Disk"
 
-            # Check if this folder already exists in catalog
+            # Each folder on disk has its own distinct key in catalog
             key = folder_name
             for k, ex in catalog.items():
-                if ex.get("title", "").lower() == clean_title.lower() or k.lower() == folder_name.lower():
+                if k.lower() == folder_name.lower() or (ex.get("directory", "").replace('\\', '/').rstrip('/') == gp.replace('\\', '/').rstrip('/')):
                     key = k
                     break
 
@@ -2490,11 +2513,11 @@ class GameCatalog:
         for md_t, md_entry in md_data.items():
             already = False
             for k, ex in catalog.items():
-                if ex.get("title", "").lower() == md_t.lower():
+                if ex.get("title", "").lower() == md_t.lower() and ex.get("version", "v1.0") == md_entry.get("version", "v1.0"):
                     already = True
                     break
             if not already:
-                key = md_t.replace(' ', '_')
+                key = f"{md_t.replace(' ', '_')}-{md_entry.get('version', 'v1.0')}"
                 catalog[key] = {
                     "title": md_t,
                     "version": md_entry.get("version", "v1.0"),
@@ -2507,7 +2530,7 @@ class GameCatalog:
                     "last_downloaded": md_entry.get("last_downloaded", "Unknown"),
                     "last_checked": datetime.now(timezone.utc).strftime('%Y-%m-%d')
                 }
-                print(f"  [+] Added from log: {md_t:<32} (Archived / Not on disk)")
+                print(f"  [+] Added from log: {md_t:<32} ({md_entry.get('version', 'v1.0')}) [Archived / Not on disk]")
 
         cls.save_catalog(catalog)
         cls.sync_markdown(catalog)
@@ -2602,45 +2625,113 @@ class GameCatalog:
         print(f"[X] Error: Could not resolve target '{target}' to a local game folder or valid URL.")
 
     @classmethod
-    def archive_game(cls, target, auto_yes=False):
+    def find_matching_disk_games(cls, target, scan_dir="downloads"):
         """
-        Saves metadata & version into catalog as Archived, then safely deletes local files to reclaim disk space.
+        Discovers all local game installations matching target by:
+        1. Exact directory path or folder name
+        2. Catalog title (e.g. "Seven Sins", "Between Rounds")
+        3. Normalized title / slug
+        4. Title + version string (e.g. "Seven Sins v1.10")
+        Returns a list of dicts sorted with newest version first:
+        [{"dir": path, "folder": name, "title": title, "version": ver, "size": size, "ver_match": bool, "meta": dict}, ...]
         """
+        if not target:
+            return []
+        raw_target = target.strip('\'" \t\r\n')
+        target_norm = re.sub(r'[^a-zA-Z0-9]', '', raw_target).lower()
+
+        # Check if user specified a version in target string (e.g. "Seven Sins v1.10" or "Between_Rounds-v3.1")
+        m_ver = re.search(r'[\s\-_]v?(\d+(?:\.[\d\w\-]+)+)', raw_target, re.I)
+        target_ver = m_ver.group(1).lower() if m_ver else None
+        target_base = re.sub(r'[\s\-_]+v?\d+(?:\.[\d\w\-]+)+.*$', '', raw_target, flags=re.I).strip() if target_ver else raw_target
+        target_base_norm = re.sub(r'[^a-zA-Z0-9]', '', target_base).lower()
+
+        disk_dirs = GameUpdateChecker.find_game_directories(scan_dir) if os.path.exists(scan_dir) else []
+        for cand in [raw_target, os.path.join(scan_dir, "html", raw_target), os.path.join(scan_dir, "renpy", raw_target), os.path.join(scan_dir, raw_target)]:
+            if os.path.isdir(cand) and cand not in disk_dirs:
+                disk_dirs.append(cand)
+
         catalog = cls.load_catalog()
+        matches = []
+        seen_dirs = set()
 
-        local_dir = None
-        for cand in [target, os.path.join("downloads", "html", target), os.path.join("downloads", "renpy", target), os.path.join("downloads", target)]:
-            if os.path.isdir(cand):
-                local_dir = cand
-                break
+        for d_path in disk_dirs:
+            norm_d = os.path.abspath(d_path)
+            if norm_d in seen_dirs:
+                continue
+            seen_dirs.add(norm_d)
 
-        if not local_dir:
-            print(f"[X] Error: Local game folder '{target}' not found.")
-            return
+            folder_name = os.path.basename(d_path)
+            ver = cls.detect_version_from_folder(d_path)
 
-        folder_name = os.path.basename(local_dir)
-        version = cls.detect_version_from_folder(local_dir)
-        dir_size = GameCompactor.get_directory_size(local_dir)
+            meta_file = os.path.join(d_path, "game_meta.json")
+            meta = {}
+            if os.path.exists(meta_file):
+                try:
+                    with open(meta_file, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                except Exception:
+                    pass
+
+            cat_title = catalog.get(folder_name, {}).get("title")
+            raw_title = cat_title or meta.get("game_name") or re.sub(r'-(v[0-9]+(?:\.[0-9a-zA-Z_\-]+)*)$', '', folder_name, flags=re.I)
+            clean_title = raw_title.replace('_', ' ').strip()
+            if "risen" in folder_name.lower():
+                clean_title = "Risen City"
+
+            title_norm = re.sub(r'[^a-zA-Z0-9]', '', clean_title).lower()
+            folder_norm = re.sub(r'[^a-zA-Z0-9]', '', folder_name).lower()
+            ver_clean = ver.lstrip('vV').lower()
+
+            is_match = False
+            ver_match = False
+
+            if os.path.abspath(d_path) == os.path.abspath(raw_target) or folder_name.lower() == raw_target.lower():
+                is_match = True
+                ver_match = True
+            elif clean_title.lower() == raw_target.lower() or title_norm == target_norm:
+                is_match = True
+            elif clean_title.lower() == target_base.lower() or title_norm == target_base_norm:
+                is_match = True
+            elif target_base_norm and len(target_base_norm) >= 3 and (target_base_norm in folder_norm or target_base_norm in title_norm):
+                is_match = True
+
+            if is_match:
+                if target_ver and (target_ver in ver_clean or target_ver in folder_norm):
+                    ver_match = True
+                try:
+                    d_size = GameCompactor.get_directory_size(d_path)
+                except Exception:
+                    d_size = 0
+                matches.append({
+                    "dir": d_path,
+                    "folder": folder_name,
+                    "title": clean_title,
+                    "version": ver,
+                    "size": d_size,
+                    "ver_match": ver_match,
+                    "meta": meta
+                })
+
+        # Sort matches so newest version is first
+        matches.sort(key=lambda x: parse_version_tuple(x["version"]), reverse=True)
+        return matches
+
+    @classmethod
+    def _execute_archive_single(cls, match, catalog):
+        """Helper to archive a single matched game directory."""
+        local_dir = match["dir"]
+        folder_name = match["folder"]
+        clean_title = match["title"]
+        version = match["version"]
+        dir_size = match["size"]
+        meta = match.get("meta", {})
         size_str = f"{dir_size / (1024 * 1024):.1f} MB" if dir_size < 1024 * 1024 * 1024 else f"{dir_size / (1024 * 1024 * 1024):.2f} GB"
 
-        meta_file = os.path.join(local_dir, "game_meta.json")
-        meta = {}
-        if os.path.exists(meta_file):
-            try:
-                with open(meta_file, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-            except Exception:
-                pass
-
-        raw_title = meta.get("game_name") or re.sub(r'-(v[0-9]+(?:\.[0-9a-zA-Z_\-]+)*)$', '', folder_name, flags=re.I)
-        clean_title = raw_title.replace('_', ' ').strip()
-
-        # Find existing catalog entry or create
         cat_entry = catalog.get(folder_name, {})
         gamcore_url = cat_entry.get("gamcore_url") or ""
         cdn_url = meta.get("cdn_url") or meta.get("game_url") or meta.get("source_url") or cat_entry.get("cdn_url") or ""
 
-        # If gamcore_url is empty, check markdown
         if not gamcore_url:
             md_data = cls.parse_markdown_metadata()
             for md_t, md_e in md_data.items():
@@ -2650,31 +2741,6 @@ class GameCatalog:
                         cdn_url = md_e.get("cdn_url", "")
                     break
 
-        print("\n" + "=" * 80)
-        print(f" GameGrabber - Archive & Reclaim Storage")
-        print("=" * 80)
-        print(f"[*] Game Title       : {clean_title}")
-        print(f"[*] Detected Version : {version}")
-        print(f"[*] Local Directory  : {os.path.abspath(local_dir)}")
-        print(f"[*] Disk Space Freed : {size_str}")
-        print(f"[*] Gamcore URL      : {gamcore_url or 'N/A'}")
-        print(f"[*] Direct CDN URL   : {cdn_url or 'N/A'}")
-        print("-" * 80)
-        print("[!] All version and URL metadata will be preserved in 'game_catalog.json' & 'DOWNLOADED_GAMES.md'.")
-        print("[!] You can check updates and re-download fresh anytime with `scraper.py --updateall`.")
-        print("=" * 80)
-
-        if not auto_yes:
-            try:
-                ans = input(f"\n[?] Are you sure you want to archive '{clean_title}' and delete this folder? [y/N]: ").strip().lower()
-                if ans not in ['y', 'yes']:
-                    print("[*] Archiving cancelled by user.")
-                    return
-            except (KeyboardInterrupt, EOFError):
-                print("\n[*] Aborted.")
-                return
-
-        # Update catalog entry
         catalog[folder_name] = {
             "title": clean_title,
             "version": version,
@@ -2690,35 +2756,245 @@ class GameCatalog:
         }
         cls.save_catalog(catalog)
 
-        # Safely remove folder
         try:
             shutil.rmtree(local_dir)
-            print(f"\n[+] Successfully deleted '{local_dir}'! Freed {size_str} of disk space.")
+            print(f"[+] Successfully deleted '{local_dir}'! Freed {size_str} of disk space.")
         except Exception as e:
             print(f"[!] Warning: Error while deleting directory: {e}")
 
         cls.sync_markdown(catalog)
-        print(f"[+] Catalog and {cls.MARKDOWN_FILE} updated to '📦 Archived (Deleted Locally)'.\n")
+        print(f"[+] Catalog updated: '{clean_title}' ({version}) -> 📦 Archived (Deleted Locally).\n")
+        return True
+
+    @classmethod
+    def _prompt_and_archive_single(cls, match, catalog, auto_yes):
+        local_dir = match["dir"]
+        clean_title = match["title"]
+        version = match["version"]
+        dir_size = match["size"]
+        meta = match.get("meta", {})
+        folder_name = match["folder"]
+        size_str = f"{dir_size / (1024 * 1024):.1f} MB" if dir_size < 1024 * 1024 * 1024 else f"{dir_size / (1024 * 1024 * 1024):.2f} GB"
+
+        cat_entry = catalog.get(folder_name, {})
+        gamcore_url = cat_entry.get("gamcore_url") or ""
+        cdn_url = meta.get("cdn_url") or meta.get("game_url") or meta.get("source_url") or cat_entry.get("cdn_url") or ""
+
+        if not gamcore_url:
+            md_data = cls.parse_markdown_metadata()
+            for md_t, md_e in md_data.items():
+                if md_t.lower() == clean_title.lower():
+                    gamcore_url = md_e.get("gamcore_url", "")
+                    if not cdn_url:
+                        cdn_url = md_e.get("cdn_url", "")
+                    break
+
+        print("\n" + "=" * 80)
+        print(" GameGrabber - Archive & Reclaim Storage")
+        print("=" * 80)
+        print(f"[*] Game Title       : {clean_title}")
+        print(f"[*] Detected Version : {version}")
+        print(f"[*] Local Directory  : {os.path.abspath(local_dir)}")
+        print(f"[*] Disk Space Freed : {size_str}")
+        print(f"[*] Gamcore URL      : {gamcore_url or 'N/A'}")
+        print(f"[*] Direct CDN URL   : {cdn_url or 'N/A'}")
+        print("-" * 80)
+        print("[!] All version and URL metadata will be preserved in 'game_catalog.json' & 'DOWNLOADED_GAMES.md'.")
+        print("[!] You can check updates and re-download fresh anytime with `scraper.py --updateall`.")
+        print("=" * 80)
+
+        if not auto_yes:
+            try:
+                ans = input(f"\n[?] Are you sure you want to archive '{clean_title}' ({version}) and delete this folder? [y/N]: ").strip().lower()
+                if ans not in ['y', 'yes']:
+                    print("[*] Archiving cancelled by user.")
+                    return False
+            except (KeyboardInterrupt, EOFError):
+                print("\n[*] Aborted.")
+                return False
+
+        return cls._execute_archive_single(match, catalog)
+
+    @classmethod
+    def archive_game(cls, target, auto_yes=False):
+        """
+        Saves metadata & version into catalog as Archived, then safely deletes local files to reclaim disk space.
+        Supports:
+        - The name displayed in the catalog (e.g. "Seven Sins", "Between Rounds")
+        - Exact folder names (e.g. "Seven_Sins-v1.10")
+        - Directory paths (e.g. "downloads/html/Seven_Sins-v1.10")
+        If multiple versions exist on disk, displays all versions and prompts which one to archive.
+        """
+        catalog = cls.load_catalog()
+        matches = cls.find_matching_disk_games(target)
+
+        if not matches:
+            target_norm = re.sub(r'[^a-zA-Z0-9]', '', target).lower()
+            cat_matches = [e for k, e in catalog.items() if e.get("title", "").lower() == target.lower() or target_norm == re.sub(r'[^a-zA-Z0-9]', '', e.get("title", "")).lower() or target_norm in k.lower()]
+            if cat_matches:
+                print("\n" + "=" * 80)
+                print(" GameGrabber - Archive Status")
+                print("=" * 80)
+                print(f"[*] Target '{target}' is already archived in the catalog (files not present on disk):")
+                for cm in cat_matches:
+                    print(f"    * {cm.get('title')} ({cm.get('version')}) - {cm.get('status')}")
+                    if cm.get('gamcore_url'):
+                        print(f"      Gamcore URL: {cm.get('gamcore_url')}")
+                    if cm.get('cdn_url'):
+                        print(f"      CDN URL    : {cm.get('cdn_url')}")
+                print("-" * 80)
+                print("[!] Re-download anytime using: python scraper.py \"<URL>\"")
+                print("=" * 80 + "\n")
+                return False
+
+            print(f"[X] Error: No local game installation found matching '{target}'.")
+            all_disk = cls.find_matching_disk_games("")
+            if all_disk:
+                print("[*] Active games on disk:")
+                for ad in all_disk[:5]:
+                    print(f"    * {ad['title']} ({ad['version']}) -> {ad['dir']}")
+            print()
+            return False
+
+        # Check if user specified an exact version in the target string
+        ver_matches = [m for m in matches if m["ver_match"]]
+        if len(ver_matches) == 1 and len(matches) > 1:
+            chosen = ver_matches[0]
+            return cls._prompt_and_archive_single(chosen, catalog, auto_yes)
+
+        if len(matches) == 1:
+            return cls._prompt_and_archive_single(matches[0], catalog, auto_yes)
+
+        # Multiple versions detected on disk!
+        title = matches[0]["title"]
+        print("\n" + "=" * 85)
+        print(f" GameGrabber - Multiple Versions Detected for '{title}'")
+        print("=" * 85)
+        print(f"[*] Found {len(matches)} installed versions on disk:")
+        print("-" * 85)
+        total_size = sum(m["size"] for m in matches)
+        tot_sz_str = f"{total_size / (1024 * 1024):.1f} MB" if total_size < 1024 * 1024 * 1024 else f"{total_size / (1024 * 1024 * 1024):.2f} GB"
+
+        for i, m in enumerate(matches):
+            d_sz = m["size"]
+            sz_str = f"{d_sz / (1024 * 1024):.1f} MB" if d_sz < 1024 * 1024 * 1024 else f"{d_sz / (1024 * 1024 * 1024):.2f} GB"
+            tag = "(Latest Version)" if i == 0 else "(Older Version)"
+            print(f"  [{i+1}] Version: {m['version']:<10} | Size: {sz_str:>9} | Directory: {m['dir']} {tag}")
+
+        print("-" * 85)
+        print(f"  [A] Archive ALL {len(matches)} versions (Reclaim {tot_sz_str} total)")
+        print(f"  [Q] Cancel / Quit")
+        print("=" * 85)
+
+        if auto_yes:
+            print("[*] -y provided: archiving ALL versions...")
+            for m in matches:
+                cls._execute_archive_single(m, catalog)
+            return True
+
+        try:
+            choice = input(f"\n[?] Which version do you want to archive? [1-{len(matches)}, A, or Q]: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\n[*] Aborted.")
+            return False
+
+        if choice in ['q', 'quit', 'exit', '']:
+            print("[*] Archiving cancelled by user.")
+            return False
+
+        if choice in ['a', 'all']:
+            print(f"\n[*] Archiving all {len(matches)} versions of '{title}'...")
+            for m in matches:
+                cls._execute_archive_single(m, catalog)
+            return True
+
+        if choice.isdigit() and 1 <= int(choice) <= len(matches):
+            selected = matches[int(choice) - 1]
+            cls._execute_archive_single(selected, catalog)
+            return True
+
+        print("[*] Invalid selection. Archiving cancelled.")
+        return False
 
     @classmethod
     def list_catalog(cls):
-        """Displays formatted catalog table."""
+        """Displays formatted catalog table with multi-version differences and status breakdown."""
         catalog = cls.load_catalog()
         if not catalog:
             catalog = cls.sync_catalog()
 
-        print("\n" + "=" * 90)
+        # Group entries by normalized game title to analyze version differences
+        title_groups = {}
+        for key, entry in catalog.items():
+            t = entry.get("title", key)
+            t_norm = re.sub(r'[^a-zA-Z0-9]', '', t).lower()
+            title_groups.setdefault(t_norm, []).append((key, entry))
+
+        # Generate version notes per entry
+        version_notes = {}
+        for t_norm, entries in title_groups.items():
+            on_disk_entries = [e for _, e in entries if e.get("on_disk", False)]
+            archived_entries = [e for _, e in entries if not e.get("on_disk", False) and "Archived" in e.get("status", "")]
+            all_versions = [e.get("version", "v1.0") for _, e in entries]
+
+            on_disk_entries.sort(key=lambda x: parse_version_tuple(x.get("version")), reverse=True)
+            archived_entries.sort(key=lambda x: parse_version_tuple(x.get("version")), reverse=True)
+
+            if len(on_disk_entries) > 1:
+                latest_v = on_disk_entries[0].get("version")
+                for key, e in entries:
+                    if e.get("on_disk", False):
+                        if e.get("version") == latest_v:
+                            other_vers = [od.get("version") for od in on_disk_entries if od.get("version") != latest_v]
+                            version_notes[key] = f"Latest ({', '.join(other_vers)} also on disk)"
+                        else:
+                            version_notes[key] = f"Older version (latest on disk: {latest_v})"
+                    else:
+                        version_notes[key] = f"Archived prior version (active: {latest_v})"
+            elif len(on_disk_entries) == 1 and archived_entries:
+                active_v = on_disk_entries[0].get("version")
+                arch_v_str = ", ".join(ae.get("version") for ae in archived_entries)
+                for key, e in entries:
+                    if e.get("on_disk", False):
+                        version_notes[key] = f"Active on disk (prior {arch_v_str} archived)"
+                    else:
+                        version_notes[key] = f"Archived prior version (superseded by {active_v})"
+            elif len(entries) > 1:
+                for key, e in entries:
+                    version_notes[key] = f"Tracked: {', '.join(set(all_versions))}"
+
+        sorted_items = sorted(catalog.items(), key=lambda x: (not x[1].get('on_disk', False), x[1].get('title', '')))
+
+        print("\n" + "=" * 105)
         print(f" GameGrabber - Persistent Game Catalog ({len(catalog)} Tracked Games)")
-        print("=" * 90)
-        print(f"{'Game Title':<34} | {'Version':<10} | {'Status':<28} | {'On Disk':<7}")
-        print("-" * 90)
-        for key, entry in sorted(catalog.items(), key=lambda x: (not x[1].get('on_disk', False), x[1].get('title', ''))):
+        print("=" * 105)
+        print(f"{'Game Title':<32} | {'Version':<10} | {'Status':<24} | {'On Disk':<7} | {'Version Details'}")
+        print("-" * 105)
+        for key, entry in sorted_items:
             title = entry.get("title", key)
             ver = entry.get("version", "v1.0")
             st = entry.get("status", "Unknown")
             on_d = "YES" if entry.get("on_disk", False) else "NO"
-            print(f"{title[:34]:<34} | {ver:<10} | {st[:28]:<28} | {on_d:<7}")
-        print("=" * 90 + "\n")
+            v_note = version_notes.get(key, "")
+            print(f"{title[:32]:<32} | {ver:<10} | {st[:24]:<24} | {on_d:<7} | {v_note}")
+        print("=" * 105)
+
+        # Highlight multi-version games on disk
+        multi_disk = {t: ents for t, ents in title_groups.items() if len([e for _, e in ents if e.get("on_disk", False)]) > 1}
+        if multi_disk:
+            print("\n" + "-" * 105)
+            print(" 📌 MULTI-VERSION GAMES DETECTED ON DISK:")
+            for t_norm, ents in multi_disk.items():
+                title_name = ents[0][1].get("title")
+                active_list = [e for _, e in ents if e.get("on_disk", False)]
+                active_list.sort(key=lambda x: parse_version_tuple(x.get("version")), reverse=True)
+                print(f"  * {title_name}:")
+                for idx, e in enumerate(active_list):
+                    tag = "(Latest)" if idx == 0 else "(Older)"
+                    print(f"    - {e.get('version'):<10} {tag:<8} -> {e.get('directory', 'N/A')}")
+                print(f"    💡 To archive an older version and reclaim space: python scraper.py --archive \"{title_name}\"")
+            print("-" * 105)
+        print()
 
     @classmethod
     def sync_markdown(cls, catalog=None):
