@@ -198,6 +198,22 @@ AUTO_AUDIO_SCRIPT = """<script id="auto-audio-manager">
 </script>
 """
 
+def strip_auto_audio(html_text):
+    """Strips the injected Auto-Audio manager script from HTML text for clean content comparison."""
+    if not html_text:
+        return ""
+    return re.sub(r'<script\s+id=["\']auto-audio-manager["\']>.*?</script>\s*', '', html_text, flags=re.DOTALL)
+
+def normalize_html_for_comparison(html_text):
+    """Normalizes HTML by removing auto-audio scripts, hotlink blockers, analytics, and normalizing whitespace for pure game content comparison."""
+    if not html_text:
+        return ""
+    text = strip_auto_audio(html_text)
+    text = re.sub(r'<!--\s*starthotlinking\s*-->.*?<!--\s*endhotlinking\s*-->\s*', '', text, flags=re.DOTALL)
+    text = re.sub(r'<!--\s*startAnalytics\s*-->.*?<!--\s*endAnalytics\s*-->\s*', '', text, flags=re.DOTALL)
+    text = text.replace('\r\n', '\n')
+    return text.strip()
+
 AD_DOMAINS = [
     'doubleclick', 'googlesyndication', 'adtng', 'crme7srv', 'digitalclickstime',
     '69games', 'exo-right', 'yandex', 'google-analytics', 'trafficjunky',
@@ -1523,6 +1539,36 @@ class AssetDownloader:
         self.updated_count = 0
         self.downloaded_count = 0
 
+    def _handle_index_html_update(self, local_path, r, ret_etag, rel_p):
+        """Prevents false modification detections on index.html due to injected Auto-Audio manager,
+        and re-applies Auto-Audio manager if index.html was genuinely updated on the server."""
+        try:
+            with open(local_path, "r", encoding="utf-8", errors="replace") as lf:
+                local_text = lf.read()
+            remote_text = r.content.decode('utf-8', errors='replace')
+            if normalize_html_for_comparison(local_text) == normalize_html_for_comparison(remote_text):
+                with self._lock:
+                    self.cached_count += 1
+                return True, 0, "cached"
+            had_auto_audio = "auto-audio-manager" in local_text
+            if had_auto_audio and "auto-audio-manager" not in remote_text:
+                if "</body>" in remote_text:
+                    remote_text = remote_text.replace("</body>", AUTO_AUDIO_SCRIPT + "\n</body>", 1)
+                elif "</html>" in remote_text:
+                    remote_text = remote_text.replace("</html>", AUTO_AUDIO_SCRIPT + "\n</html>", 1)
+                else:
+                    remote_text += "\n" + AUTO_AUDIO_SCRIPT
+            part_path = local_path + ".part"
+            with open(part_path, "w", encoding="utf-8") as f:
+                f.write(remote_text)
+            os.replace(part_path, local_path)
+            with self._lock:
+                self.updated_count += 1
+                self.manifest[rel_p] = {"etag": ret_etag, "size": os.path.getsize(local_path), "mtime": time.time()}
+            return True, len(remote_text.encode('utf-8')), "updated"
+        except Exception:
+            return None
+
     def download_file(self, full_url, local_path):
         if self.stop_requested:
             return False, 0, "limit_reached"
@@ -1597,6 +1643,11 @@ class AssetDownloader:
                                 self.cached_count += 1
                             return True, 0, "cached"
 
+                        if rel_p.lower() == "index.html":
+                            html_res = self._handle_index_html_update(local_path, r, ret_etag, rel_p)
+                            if html_res is not None:
+                                return html_res
+
                         # File was modified! Stream new content to .part file
                         is_modified = True
                         part_path = local_path + ".part"
@@ -1631,6 +1682,11 @@ class AssetDownloader:
                                 with self._lock:
                                     self.cached_count += 1
                                 return True, 0, "cached"
+
+                            if rel_p.lower() == "index.html":
+                                html_res = self._handle_index_html_update(local_path, r, ret_etag, rel_p)
+                                if html_res is not None:
+                                    return html_res
                             is_modified = True
                             part_path = local_path + ".part"
                             downloaded_bytes = 0
@@ -1794,6 +1850,11 @@ class AssetDownloader:
                     return True, downloaded_bytes, status_name
 
                 elif r.status_code == 200:
+                    if rel_p.lower() == "index.html" and os.path.exists(local_path):
+                        html_res = self._handle_index_html_update(local_path, r, r.headers.get("ETag", "").strip('"').lower(), rel_p)
+                        if html_res is not None:
+                            return html_res
+
                     cl = int(r.headers.get("Content-Length", 0) or 0)
                     expected_total = cl if cl > 0 else -1
 
@@ -2757,7 +2818,7 @@ class GameUpdateChecker:
         return candidates
 
     @classmethod
-    def check_single_url(cls, target_url, local_mtime=None, local_etag=None, verify_ssl=True):
+    def check_single_url(cls, target_url, local_mtime=None, local_etag=None, local_index_path=None, verify_ssl=True):
         """Checks if a remote game URL or CDN build has an update available."""
         target_url = normalize_url(target_url)
         headers = {
@@ -2829,6 +2890,28 @@ class GameUpdateChecker:
                                 "remote_etag": remote_etag,
                                 "message": f"New version '{cand}' detected on CDN!"
                             }
+                    except Exception:
+                        pass
+
+            # If timestamp or ETag changed on an HTML entry point, verify whether content actually changed (ignoring auto-audio)
+            is_html_entry = clean_url.endswith('.html') or clean_url.endswith('/')
+            if local_index_path and os.path.exists(local_index_path) and is_html_entry:
+                if (remote_mtime and local_mtime and (remote_mtime - local_mtime).total_seconds() > 86400) or (remote_etag and local_etag and remote_etag != local_etag):
+                    try:
+                        r_content = requests.get(clean_url, headers=headers, timeout=6, verify=verify_ssl)
+                        if r_content.status_code == 200:
+                            with open(local_index_path, "r", encoding="utf-8", errors="replace") as lf:
+                                loc_html = lf.read()
+                            if normalize_html_for_comparison(loc_html) == normalize_html_for_comparison(r_content.text):
+                                return {
+                                    "has_update": False,
+                                    "update_type": "none",
+                                    "remote_url": clean_url,
+                                    "new_version": None,
+                                    "remote_mtime": remote_mtime,
+                                    "remote_etag": remote_etag,
+                                    "message": "Game is up to date (code verified identical; auto-audio manager preserved)."
+                                }
                     except Exception:
                         pass
 
@@ -2993,10 +3076,12 @@ class GameUpdateChecker:
         print("=" * 95)
 
         def worker(game):
+            index_p = os.path.join(game["path"], "index.html") if game.get("path") else None
             res = cls.check_single_url(
                 game["url"],
                 local_mtime=game["local_mtime"],
                 local_etag=game["local_etag"],
+                local_index_path=index_p,
                 verify_ssl=verify_ssl
             ) if game["url"] else {"has_update": False, "update_type": "no_url", "message": "No remote URL configured"}
             return game, res
@@ -3231,6 +3316,7 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
         "source_url": url,
         "game_url": game_url,
         "engine": detected_engine,
+        "auto_audio": True,
         "status": "in_progress",
         "last_started": datetime.now().isoformat()
     }
@@ -3527,7 +3613,10 @@ if __name__ == "__main__":
     # 9. Build Download Queue (Preserving Story Order and Filtering if requested)
     asset_map = {}
     video_exts = ('.mp4', '.webm', '.avi', '.mov', '.mkv', '.m4v')
+    skip_download_assets = {"index.html", "game_meta.json", "run_game.bat", "run_game.py"}
     for rel_path in discovered_assets:
+        if rel_path.lower() in skip_download_assets:
+            continue
         if no_videos and rel_path.lower().endswith(video_exts):
             continue
         safe_rel = quote(unquote(rel_path.replace('+', '%2B')), safe="/()'!~,-_.@")
@@ -3535,6 +3624,8 @@ if __name__ == "__main__":
         asset_map[rel_path] = full_url
 
     for ext_url, local_rel in external_assets.items():
+        if local_rel.lower() in skip_download_assets:
+            continue
         if no_videos and local_rel.lower().endswith(video_exts):
             continue
         asset_map[local_rel] = ext_url
@@ -3932,6 +4023,9 @@ class GameAudioFixer:
             return "no_html", "No index.html found"
 
         try:
+            st = os.stat(index_path)
+            orig_atime = st.st_atime
+            orig_mtime = st.st_mtime
             with open(index_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
         except Exception as e:
@@ -3949,6 +4043,8 @@ class GameAudioFixer:
                 try:
                     with open(index_path, "w", encoding="utf-8") as f:
                         f.write(updated)
+                    os.utime(index_path, (orig_atime, orig_mtime))
+                    cls._mark_meta(game_dir)
                     return "updated", "Upgraded to In-Viewport Pause & Audio Manager"
                 except Exception as e:
                     return "error", f"Write error: {e}"
@@ -3966,9 +4062,26 @@ class GameAudioFixer:
         try:
             with open(index_path, "w", encoding="utf-8") as f:
                 f.write(updated)
+            os.utime(index_path, (orig_atime, orig_mtime))
+            cls._mark_meta(game_dir)
             return "injected", "Injected successfully"
         except Exception as e:
             return "error", f"Write error: {e}"
+
+    @classmethod
+    def _mark_meta(cls, game_dir):
+        meta_path = os.path.join(game_dir, "game_meta.json")
+        if os.path.exists(meta_path):
+            try:
+                st = os.stat(meta_path)
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                meta["auto_audio"] = True
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump(meta, f, indent=2)
+                os.utime(meta_path, (st.st_atime, st.st_mtime))
+            except Exception:
+                pass
 
     @classmethod
     def fix_directory(cls, target_dir="downloads"):
@@ -4295,6 +4408,7 @@ Examples:
             remote_url,
             local_mtime=local_mtime,
             local_etag=local_etag,
+            local_index_path=index_file if (local_path and os.path.exists(index_file)) else None,
             verify_ssl=not args.no_verify
         )
 
