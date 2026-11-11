@@ -682,6 +682,18 @@ def get_remote_file_info(session, url, referer=None, verify_ssl=True):
             return r.status_code, cl, etag, lm
         elif r.status_code in [404, 403]:
             return r.status_code, 0, None, None
+    except requests.exceptions.SSLError:
+        try:
+            r = session.head(safe_url, headers=headers, verify=False, timeout=8, allow_redirects=True)
+            if r.status_code in [200, 206]:
+                cl = int(r.headers.get("Content-Length", 0) or 0)
+                etag = r.headers.get("ETag", "").strip('"')
+                lm = r.headers.get("Last-Modified")
+                return r.status_code, cl, etag, lm
+            elif r.status_code in [404, 403]:
+                return r.status_code, 0, None, None
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -706,6 +718,19 @@ def get_remote_file_info(session, url, referer=None, verify_ssl=True):
             lm = r.headers.get("Last-Modified")
             return 200, cl, etag, lm
         return r.status_code, 0, None, None
+    except requests.exceptions.SSLError:
+        try:
+            h = dict(headers)
+            h["Range"] = "bytes=0-0"
+            r = session.get(safe_url, headers=h, verify=False, timeout=8, stream=True)
+            if r.status_code in [200, 206]:
+                cl = int(r.headers.get("Content-Length", 0) or 0)
+                etag = r.headers.get("ETag", "").strip('"')
+                lm = r.headers.get("Last-Modified")
+                return 200, cl, etag, lm
+        except Exception:
+            pass
+        return 0, 0, None, None
     except Exception:
         return 0, 0, None, None
 
@@ -784,7 +809,7 @@ class GameURLExtractor:
 
         if candidates:
             candidates.sort(key=lambda x: x[0], reverse=True)
-            chosen_url = candidates[0][1]
+            chosen_url = normalize_url(candidates[0][1])
             print(f"[+] Found Game Frame URL: {chosen_url}")
             return chosen_url
 
@@ -792,11 +817,12 @@ class GameURLExtractor:
             f_url = frame.url
             if f_url and f_url != initial_url and f_url != 'about:blank':
                 if not any(ad in f_url.lower() for ad in AD_DOMAINS):
-                    print(f"[+] Found Frame in page tree: {f_url}")
-                    return f_url
+                    norm_f = normalize_url(f_url)
+                    print(f"[+] Found Frame in page tree: {norm_f}")
+                    return norm_f
 
         print("[*] No separate iframe detected. Treating initial URL as game entry point.")
-        return initial_url
+        return normalize_url(initial_url)
 
 # ==============================================================================
 # ENGINE DETECTOR & INTROSPECTOR
@@ -928,6 +954,102 @@ class RenPyHandler:
 
 class SugarCubeHandler:
     """Handles SugarCube / Twine games: resolves passages, story graph, choices, and macros."""
+
+    @staticmethod
+    def extract_js_object(text, var_name):
+        """Finds `var_name = { ... }` or `setup.var_name = { ... }` and parses it into a Python dict."""
+        m = re.search(r'(?:(?:var|let|const|setup\.)\s*)?' + re.escape(var_name) + r'\s*=\s*(\{)', text)
+        if not m:
+            return None
+        start = m.start(1)
+        depth = 0
+        in_string = False
+        quote_char = ''
+        end = -1
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if ch == quote_char and text[i-1] != '\\':
+                    in_string = False
+            else:
+                if ch in ('"', "'", '`'):
+                    in_string = True
+                    quote_char = ch
+                elif ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+        if end == -1:
+            return None
+        obj_str = text[start:end]
+        obj_str = re.sub(r'//[^\n]*', '', obj_str)
+        obj_str = re.sub(r'/\*.*?\*/', '', obj_str, flags=re.DOTALL)
+        obj_str = re.sub(r'(?<=[\{,\n\r\t ])([a-zA-Z0-9_$]+)\s*:', r'"\1":', obj_str)
+        obj_str = re.sub(r"'([^'\\]*(?:\\.[^'\\]*)*)'", r'"\1"', obj_str)
+        obj_str = re.sub(r',\s*([\}\]])', r'\1', obj_str)
+        try:
+            return json.loads(obj_str)
+        except Exception:
+            return None
+
+    @staticmethod
+    def discover_dynamic_assets(html_content):
+        dynamic_assets = set()
+        unescaped = html.unescape(html_content)
+
+        # 1. Look for pools (e.g. tribePools, slavePools, npcPools, etc.)
+        pool_vars = re.findall(r'(?:setup\.)?(\w*Pools?)\s*=\s*\{', unescaped)
+        for p_var in set(pool_vars):
+            pool_dict = SugarCubeHandler.extract_js_object(unescaped, p_var)
+            if isinstance(pool_dict, dict):
+                base_category = "Tribe" if "tribe" in p_var.lower() else ("Slaves" if "slave" in p_var.lower() else p_var.replace("Pools", "").replace("pools", "").capitalize())
+                for origin, data in pool_dict.items():
+                    if isinstance(data, dict):
+                        o_lower = origin.lower()
+                        m_count = data.get("maleImgCount", 0) or data.get("maleCount", 0)
+                        f_count = data.get("femaleImgCount", 0) or data.get("femaleCount", 0)
+                        gen_count = data.get("imgCount", 0) or data.get("count", 0)
+                        for i in range(1, int(m_count) + 1):
+                            dynamic_assets.add(f"images/NPC/{base_category}/male/{o_lower}/{i}.webp")
+                        for i in range(1, int(f_count) + 1):
+                            dynamic_assets.add(f"images/NPC/{base_category}/female/{o_lower}/{i}.webp")
+                        for i in range(1, int(gen_count) + 1):
+                            dynamic_assets.add(f"images/NPC/{base_category}/{o_lower}/{i}.webp")
+
+        # 2. Look for action / video count tables (e.g. genericCounts, specificCounts)
+        gc = SugarCubeHandler.extract_js_object(unescaped, "genericCounts")
+        if isinstance(gc, dict):
+            for combo, actions in gc.items():
+                if isinstance(actions, dict) and "_" in combo:
+                    p_gen, n_gen = combo.split("_", 1)
+                    for prefix, count in actions.items():
+                        if isinstance(count, (int, float)):
+                            for v in range(1, int(count) + 1):
+                                dynamic_assets.add(f"images/intimacy/{p_gen}_player/with_{n_gen}/generic/{prefix}_{v}.webm")
+
+        sc = SugarCubeHandler.extract_js_object(unescaped, "specificCounts")
+        if isinstance(sc, dict):
+            for scene_key, actions in sc.items():
+                if isinstance(actions, dict) and "_" in scene_key:
+                    parts = scene_key.split("_")
+                    if len(parts) >= 3:
+                        p_gen, n_gen = parts[0], parts[1]
+                        origin = "_".join(parts[2:])
+                        for prefix, count in actions.items():
+                            if isinstance(count, (int, float)):
+                                for v in range(1, int(count) + 1):
+                                    dynamic_assets.add(f"images/intimacy/{p_gen}_player/with_{n_gen}/{origin}/{prefix}_{v}.webm")
+
+        # 3. Look for explicit img/video properties in setup or object presets
+        for m in re.finditer(r'(?:img|video|profile|fight|image|bg|sound|audio)\s*:\s*[\'"]([^\'"\r\n\t<>]+)[\'"]', unescaped):
+            val = m.group(1).strip()
+            if "." in val and ("/" in val or any(val.lower().endswith(ext) for ext in ['.webp', '.png', '.jpg', '.webm', '.mp4', '.ogg', '.mp3'])):
+                dynamic_assets.add(val.replace('\\', '/').lstrip('/'))
+
+        return dynamic_assets
 
     @staticmethod
     def parse_story(html_content, game_url, metadata):
@@ -1146,6 +1268,14 @@ class SugarCubeHandler:
                     seen_assets.add(vid)
                     discovered_assets.append(vid)
 
+        # Step A2: Dynamic asset templates (pools, intimacy count objects, setup dictionaries)
+        dynamic_candidates = SugarCubeHandler.discover_dynamic_assets(html_content)
+        for dyn in dynamic_candidates:
+            c = resolve_media_path(dyn)
+            if c and c not in seen_assets:
+                seen_assets.add(c)
+                discovered_assets.append(c)
+
         # Step B: Fallback regex scan across global unescaped HTML/scripts
         ext_pattern = '|'.join(MEDIA_EXTENSIONS)
         for m in re.finditer(r'[\'"]([^\'"\r\n\t<>]+\.(?:' + ext_pattern + r'))[\'"]', unescaped, re.I):
@@ -1239,6 +1369,132 @@ class ConstructHandler:
             except Exception:
                 pass
         return assets
+
+class HTML5Handler:
+    """Handles generic HTML5, PixiJS, Phaser, custom WebGL, and Visual Novel engines:
+    Recursively discovers scripts, stylesheets, and JSON databases, and extracts static and dynamic media assets."""
+
+    @staticmethod
+    def discover_assets(game_url, page_html, session, verify_ssl, captured_urls=None, captured_responses=None):
+        discovered = set()
+        scanned_files = set()
+        queue = []
+        captured_responses = captured_responses or {}
+        captured_urls = captured_urls or set()
+
+        print("[*] HTML5 engine: Performing deep recursive script and database inspection...")
+
+        # 1. Start with the root HTML page
+        queue.append(("index.html", page_html))
+
+        # 2. Add any script, json, or css files already captured in runtime memory
+        parsed_game_url = urlparse(game_url)
+        base_game_dir = os.path.dirname(parsed_game_url.path)
+        if not base_game_dir.endswith('/'):
+            base_game_dir += '/'
+
+        for u, body in captured_responses.items():
+            pu = urlparse(u)
+            if pu.netloc == parsed_game_url.netloc and pu.path.startswith(base_game_dir):
+                rel = pu.path[len(base_game_dir):].lstrip('/')
+                clean_rel = clean_relative_path(rel)
+                ext = clean_rel.rsplit('.', 1)[-1].lower() if '.' in clean_rel else ''
+                if ext in ['js', 'json', 'css', 'html', 'txt']:
+                    try:
+                        text = body.decode('utf-8', errors='ignore')
+                        queue.append((clean_rel, text))
+                    except Exception:
+                        pass
+
+        # Also find all scripts and stylesheets in the HTML
+        scripts = re.findall(r'<script[^>]+src=[\'"]([^\'"]+)[\'"]', page_html, re.I)
+        styles = re.findall(r'<link[^>]+(?:href|src)=[\'"]([^\'"]+)[\'"]', page_html, re.I)
+        for s in scripts + styles:
+            c = clean_relative_path(s)
+            if c:
+                discovered.add(c)
+                if c not in scanned_files:
+                    queue.append((c, None))
+
+        img_vid_exts = ('.gif', '.png', '.jpg', '.jpeg', '.webp', '.mp4', '.webm', '.mov', '.m4v')
+
+        while queue:
+            file_name, text = queue.pop(0)
+            if file_name in scanned_files:
+                continue
+            scanned_files.add(file_name)
+
+            # If text is None, attempt to fetch the file content
+            if text is None:
+                matched_body = None
+                for u, body in captured_responses.items():
+                    if u.split('?')[0].endswith(file_name.lstrip('/')):
+                        matched_body = body
+                        break
+                if matched_body:
+                    try:
+                        text = matched_body.decode('utf-8', errors='ignore')
+                    except Exception:
+                        text = None
+                elif session:
+                    try:
+                        full_cand_url = urljoin(game_url, file_name)
+                        r = session.get(full_cand_url, verify=verify_ssl, timeout=5)
+                        if r.status_code == 200:
+                            text = r.text
+                    except Exception:
+                        pass
+
+            if not text:
+                continue
+
+            # A. Scan for quoted paths with known extensions
+            ext_pattern = '|'.join(ALL_EXTENSIONS)
+            for m in re.finditer(r'[\'"]([a-zA-Z0-9_\-/\\]+\.(?:' + ext_pattern + r'))[\'"]', text, re.I):
+                val = m.group(1).replace('\\', '/').lstrip('/')
+                if not val.startswith(('http://', 'https://', 'data:')):
+                    c = clean_relative_path(val)
+                    if c:
+                        discovered.add(c)
+                        c_ext = c.rsplit('.', 1)[-1].lower() if '.' in c else ''
+                        if c_ext in ['json', 'js', 'css'] and c not in scanned_files and len(scanned_files) < 150:
+                            queue.append((c, None))
+
+            # B. Extract extensionless or dynamic media object references (common in VN engines)
+            vid_matches = re.findall(r'\b(?:video|clip|anim|media|scene|image|img|sound|audio)\s*:\s*[\'"]([^\'"\r\n\t<>]+)[\'"]', text, re.I)
+            vid_assigns = re.findall(r'(?:\.video|\.image|\.src)\s*=\s*[\'"]([^\'"\r\n\t<>]+)[\'"]', text, re.I)
+            all_media_ids = set(vid_matches + vid_assigns)
+
+            # Detect potential base media folders
+            base_folders = set(re.findall(r'[\'"]([a-zA-Z0-9_\-]+/(?:adult|videos|media|scenes|movies|images|audio|sounds)/)[\'"]', text, re.I))
+            if not base_folders:
+                base_folders = {"assets/adult/", "assets/videos/", "videos/", "assets/", "images/"}
+
+            for v_id in all_media_ids:
+                v_clean = v_id.replace('\\', '/').strip('/')
+                if not v_clean or v_clean.startswith(('http://', 'https://', 'data:')) or len(v_clean) > 120:
+                    continue
+                # If it already has a media extension
+                if v_clean.lower().endswith(img_vid_exts):
+                    discovered.add(v_clean)
+                    for bf in base_folders:
+                        discovered.add(f"{bf}{v_clean}")
+                else:
+                    # Extensionless ID: candidate for .mp4, .webm, .webp, .png
+                    for ext in ['.mp4', '.webm', '.webp', '.png']:
+                        cand = f"{v_clean}{ext}"
+                        discovered.add(cand)
+                        for bf in base_folders:
+                            discovered.add(f"{bf}{cand}")
+                            # Also check character subdirectories if not qualified
+                            if "/" not in v_clean:
+                                for char_name in ["lily", "maya", "noelle", "sabrina", "claire", "vivian", "chloe", "zoe", "jade", "amber", "kira", "harper", "serena"]:
+                                    if v_clean.lower().startswith(char_name):
+                                        discovered.add(f"{bf}{char_name}/{cand}")
+                                        break
+
+        print(f"[+] HTML5 deep inspection discovered {len(discovered)} assets across {len(scanned_files)} files.")
+        return discovered
 
 # ==============================================================================
 # ATOMIC & RESUMABLE MULTI-THREADED ASSET DOWNLOADER
@@ -1360,6 +1616,43 @@ class AssetDownloader:
                         return True, downloaded_bytes, "updated"
                     elif r.status_code in [404, 403]:
                         return False, 0, f"http_{r.status_code}"
+                except requests.exceptions.SSLError:
+                    self.verify_ssl = False
+                    try:
+                        r = self.session.get(safe_request_url, headers=headers, verify=False, stream=True, timeout=25)
+                        if r.status_code == 304:
+                            with self._lock:
+                                self.cached_count += 1
+                            return True, 0, "cached"
+                        elif r.status_code == 200:
+                            ret_etag = r.headers.get("ETag", "").strip('"').lower()
+                            ret_len = int(r.headers.get("Content-Length", 0) or 0)
+                            if known_etag and ret_etag == known_etag.lower() and ret_len == os.path.getsize(local_path):
+                                with self._lock:
+                                    self.cached_count += 1
+                                return True, 0, "cached"
+                            is_modified = True
+                            part_path = local_path + ".part"
+                            downloaded_bytes = 0
+                            with open(part_path, "wb") as f:
+                                for chunk in r.iter_content(chunk_size=65536):
+                                    if chunk:
+                                        f.write(chunk)
+                                        downloaded_bytes += len(chunk)
+                                        with self._lock:
+                                            self.total_downloaded_bytes += len(chunk)
+                            os.replace(part_path, local_path)
+                            new_etag = ret_etag or (file_md5(local_path) if downloaded_bytes < 100 * 1024 * 1024 else None)
+                            with self._lock:
+                                self.updated_count += 1
+                                self.manifest[rel_p] = {"etag": new_etag, "size": downloaded_bytes, "mtime": time.time()}
+                            return True, downloaded_bytes, "updated"
+                        elif r.status_code in [404, 403]:
+                            return False, 0, f"http_{r.status_code}"
+                    except Exception:
+                        with self._lock:
+                            self.cached_count += 1
+                        return True, 0, "cached"
                 except Exception:
                     with self._lock:
                         self.cached_count += 1
@@ -1554,6 +1847,9 @@ class AssetDownloader:
                             pass
                     return False, 0, f"http_{r.status_code}"
 
+            except requests.exceptions.SSLError:
+                self.verify_ssl = False
+                continue
             except Exception:
                 time.sleep(1)
 
@@ -2799,6 +3095,7 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
                 browser.close()
                 return
 
+        game_url = normalize_url(game_url)
         print(f"[+] Final Game Target: {game_url}")
 
         # 2. Navigate to Game URL and sniff runtime network
@@ -2962,32 +3259,15 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
         discovered_assets.update(c_assets)
 
     else:
-        print("[*] Running generic deep scan for HTML5 assets...")
-        # Check for pre-audited manifest if available
-        anl_manifest = os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-cli", "brain", "f1a879a6-f2d9-405f-a291-c8777f71861c", "scratch", "anl_manifest.json")
-        if "a_new_life" in game_url.lower() and os.path.exists(anl_manifest):
-            try:
-                with open(anl_manifest, "r", encoding="utf-8") as mf:
-                    anl_assets = json.load(mf)
-                    for a in anl_assets:
-                        discovered_assets.add(a)
-                print(f"[+] Loaded {len(anl_assets)} verified assets from A New Life manifest.")
-            except Exception as e:
-                print(f"[!] Warning reading manifest: {e}")
-
-        # Extract all script and stylesheet dependencies
-        scripts = re.findall(r'<script[^>]+src=[\'"]([^\'"]+)[\'"]', page_html, re.I)
-        styles = re.findall(r'<link[^>]+(?:href|src)=[\'"]([^\'"]+)[\'"]', page_html, re.I)
-        for s in scripts + styles:
-            c = clean_relative_path(s)
-            if c:
-                discovered_assets.add(c)
-
-        media_regex = re.compile(r'([a-zA-Z0-9_\-./]+\.(?:' + '|'.join(ALL_EXTENSIONS) + r'))', re.I)
-        for m in media_regex.finditer(page_html):
-            c = clean_relative_path(m.group(1))
-            if c:
-                discovered_assets.add(c)
+        html5_assets = HTML5Handler.discover_assets(
+            game_url=game_url,
+            page_html=page_html,
+            session=session,
+            verify_ssl=verify_ssl,
+            captured_urls=captured_urls,
+            captured_responses=captured_responses
+        )
+        discovered_assets.update(html5_assets)
 
     # Include all captured same-origin assets from Playwright
     parsed_game_url = urlparse(game_url)
