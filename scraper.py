@@ -2306,7 +2306,7 @@ class GameCatalog:
         Multi-layered version detection inspecting internal game files rather than just folder name:
         1. Explicit 'game_version' / 'version' inside game_meta.json (filtering out Twine/SugarCube engine strings)
         2. Remote CDN / Source URLs in game_meta.json (e.g. /v_1.10/, /v_0.79/, /v_ch.3/, /episode_1/)
-        3. <title> tag in index.html (e.g. 'RISEN CITY 0.3' -> 'v0.3', 'Dragon Lewd Z v1.0.3.1' -> 'v1.0.3.1')
+        3. <title> tag in index.html (e.g. 'Space Adventure 0.3' -> 'v0.3', 'Game Title v1.0.3.1' -> 'v1.0.3.1')
         4. Folder name suffix (-v1.10, -v0.79)
         """
         folder_name = os.path.basename(folder_path)
@@ -2471,10 +2471,8 @@ class GameCatalog:
 
             version = cls.detect_version_from_folder(gp)
             raw_title = meta.get("game_name") or re.sub(r'-(v[0-9]+(?:\.[0-9a-zA-Z_\-]+)*)$', '', folder_name, flags=re.I)
+            raw_title = re.sub(r'[\s\-_]v?\d+(?:\.[\d\w\-]+)+$', '', raw_title, flags=re.I)
             clean_title = raw_title.replace('_', ' ').strip()
-            # If folder is Risen_City or title has numbers like RISEN CITY 0.3, normalize title
-            if "risen" in folder_name.lower():
-                clean_title = "Risen City"
 
             # Find matching md entry
             md_match = None
@@ -2629,9 +2627,9 @@ class GameCatalog:
         """
         Discovers all local game installations matching target by:
         1. Exact directory path or folder name
-        2. Catalog title (e.g. "Seven Sins", "Between Rounds")
+        2. Catalog title (e.g. "Space Adventure")
         3. Normalized title / slug
-        4. Title + version string (e.g. "Seven Sins v1.10")
+        4. Title + version string (e.g. "Space Adventure v1.10")
         Returns a list of dicts sorted with newest version first:
         [{"dir": path, "folder": name, "title": title, "version": ver, "size": size, "ver_match": bool, "meta": dict}, ...]
         """
@@ -2640,7 +2638,7 @@ class GameCatalog:
         raw_target = target.strip('\'" \t\r\n')
         target_norm = re.sub(r'[^a-zA-Z0-9]', '', raw_target).lower()
 
-        # Check if user specified a version in target string (e.g. "Seven Sins v1.10" or "Between_Rounds-v3.1")
+        # Check if user specified a version in target string (e.g. "Game Title v1.10" or "Game_Folder-v3.1")
         m_ver = re.search(r'[\s\-_]v?(\d+(?:\.[\d\w\-]+)+)', raw_target, re.I)
         target_ver = m_ver.group(1).lower() if m_ver else None
         target_base = re.sub(r'[\s\-_]+v?\d+(?:\.[\d\w\-]+)+.*$', '', raw_target, flags=re.I).strip() if target_ver else raw_target
@@ -2675,9 +2673,8 @@ class GameCatalog:
 
             cat_title = catalog.get(folder_name, {}).get("title")
             raw_title = cat_title or meta.get("game_name") or re.sub(r'-(v[0-9]+(?:\.[0-9a-zA-Z_\-]+)*)$', '', folder_name, flags=re.I)
+            raw_title = re.sub(r'[\s\-_]v?\d+(?:\.[\d\w\-]+)+$', '', raw_title, flags=re.I)
             clean_title = raw_title.replace('_', ' ').strip()
-            if "risen" in folder_name.lower():
-                clean_title = "Risen City"
 
             title_norm = re.sub(r'[^a-zA-Z0-9]', '', clean_title).lower()
             folder_norm = re.sub(r'[^a-zA-Z0-9]', '', folder_name).lower()
@@ -2796,7 +2793,7 @@ class GameCatalog:
         print(f"[*] Detected Version : {version}")
         print(f"[*] Local Directory  : {os.path.abspath(local_dir)}")
         print(f"[*] Disk Space Freed : {size_str}")
-        print(f"[*] Gamcore URL      : {gamcore_url or 'N/A'}")
+        print(f"[*] Portal URL       : {gamcore_url or 'N/A'}")
         print(f"[*] Direct CDN URL   : {cdn_url or 'N/A'}")
         print("-" * 80)
         print("[!] All version and URL metadata will be preserved in 'game_catalog.json' & 'DOWNLOADED_GAMES.md'.")
@@ -2839,7 +2836,7 @@ class GameCatalog:
                 for cm in cat_matches:
                     print(f"    * {cm.get('title')} ({cm.get('version')}) - {cm.get('status')}")
                     if cm.get('gamcore_url'):
-                        print(f"      Gamcore URL: {cm.get('gamcore_url')}")
+                        print(f"      Portal URL : {cm.get('gamcore_url')}")
                     if cm.get('cdn_url'):
                         print(f"      CDN URL    : {cm.get('cdn_url')}")
                 print("-" * 80)
