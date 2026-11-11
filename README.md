@@ -107,19 +107,19 @@ python scraper.py --updateall -y
 Check a specific downloaded installation or remote game URL:
 ```bash
 # Checks if an update exists and asks [y/N] before downloading:
-python scraper.py "Seven_Sins-v1.10" --update
+python scraper.py "Folder name" --update
 
 # Automatically download if an update is found:
-python scraper.py "Seven_Sins-v1.10" --update -y
+python scraper.py "Folder name" --update -y
 
 # Check directly via remote URL:
-python scraper.py "https://gamcore.com/games/seven_sins" --update
+python scraper.py "URL" --update
 ```
 
 ### 6. Differential Updates & Asset Verification (`--diff`)
 Updates automatically seed existing assets and only download the delta. You can also explicitly trigger differential verification on any existing directory:
 ```bash
-python scraper.py "Seven_Sins-v1.10" --diff
+python scraper.py "Folder name" --diff
 ```
 
 ### 7. Compact & Reclaim Storage Space (`--compact`)
@@ -137,7 +137,7 @@ python scraper.py --compact
 python scraper.py --compact "downloads/html"
 
 # Compact a single specific game folder:
-python scraper.py --compact "The_DICKtator-v2.5.1"
+python scraper.py --compact "Folder name"
 ```
 
 ### 8. Auto-Audio & In-Viewport Playback Manager (`--audio-fix`)
@@ -160,11 +160,11 @@ python scraper.py --audio-fix "downloads/html"
 python scraper.py --audio-fix "downloads/renpy"
 
 # Scan or fix a specific game folder:
-python scraper.py --audio-fix "Candid_Urban_Muffs-v1.0"
+python scraper.py --audio-fix "Folder name"
 ```
 
 ### 9. Persistent Game Catalog & Reclaiming Storage (`--archive`, `--register`, `--catalog`)
-When downloading heavy games, local storage can fill up quickly. GameGrabber includes a persistent catalog system (`game_catalog.json` synced with `DOWNLOADED_GAMES.md`) that preserves all game titles, internal versions, Gamcore portal links, and origin CDN URLs even after local files are deleted:
+When downloading heavy games, local storage can fill up quickly. GameGrabber includes a persistent catalog system (`game_catalog.json` synced with `DOWNLOADED_GAMES.md`) that preserves all game titles, internal versions, portal links, and origin CDN URLs even after local files are deleted:
 
 * **Internal Version Detection:** Detects true game versions by inspecting internal files (`game_meta.json`, CDN URL paths, `index.html` `<title>`), so renamed folders never lose their real version.
 * **Archive & Free Space (`--archive`):** Backs up all version and link metadata to the catalog, marks the game as `📦 Archived`, prompts for confirmation, and safely deletes the folder to free disk space.
@@ -179,15 +179,15 @@ python scraper.py --catalog
 python scraper.py --sync-catalog
 
 # Explicitly register a downloaded game or online URL into the catalog (keeps local files intact):
-python scraper.py --register "Seven_Sins-v1.10"
-python scraper.py --register "https://gamcore.com/games/college_daze"
+python scraper.py --register "Folder name"
+python scraper.py --register "URL"
 
 # Archive a finished or heavy game to reclaim gigabytes of disk space:
-python scraper.py --archive "Fairytale-v1.0"
-python scraper.py --archive "Fairytale-v1.0" -y
+python scraper.py --archive "Folder name"
+python scraper.py --archive "Folder name" -y
 
 # Check for updates on an archived game (even if not on disk):
-python scraper.py "Fairytale" --update
+python scraper.py "Folder name" --update
 ```
 
 ---
@@ -195,19 +195,27 @@ python scraper.py "Fairytale" --update
 ## 📖 CLI Reference (`--help`)
 
 ```text
-usage: scraper.py [-h] [--update] [--updateall [DIR]] [-y] [--diff] [-o DIR]
-                  [--play-now] [--stream-only] [--no-videos] [--headed]
-                  [--no-verify] [--wait SEC] [--threads N] [--serve]
-                  [--limit MB] [--proxy URL]
+usage: scraper.py [-h] [--register TARGET] [--archive TARGET] [--sync-catalog]
+                  [--catalog] [--audio-fix [DIR]] [--compact [DIR]] [--update]
+                  [--updateall [DIR]] [-y] [--diff] [-o DIR] [--play-now]
+                  [--stream-only] [--no-videos] [--headed] [--no-verify]
+                  [--wait SEC] [--threads N] [--serve] [--limit MB]
+                  [--proxy URL]
                   [url] [dest]
 
 positional arguments:
-  url                   Target URL (Game portal page URL or direct game iframe/CDN URL) or local game folder
+  url                   Target URL (Game portal page URL or direct game iframe/CDN URL) or local downloaded game directory
   dest                  Optional custom destination directory (e.g. '.', 'advancements', 'special_downloads/here').
                         Overrides default 'downloads/<engine>/<name>' path.
 
 options:
   -h, --help            show this help message and exit
+  --register, --track TARGET
+                        Explicitly register a game folder or online URL into the persistent catalog WITHOUT deleting local files.
+  --archive TARGET      Archive a game: records versions and URLs into catalog/DOWNLOADED_GAMES.md, then safely deletes local files to reclaim disk space.
+  --sync-catalog        Scans existing downloads and tracking log to synchronize 'game_catalog.json' and 'DOWNLOADED_GAMES.md'.
+  --catalog, --list-catalog
+                        Display all games tracked in the persistent catalog with version, status, and disk presence.
   --audio-fix, --fix-audio [DIR]
                         Detect and inject Auto-Audio Focus Manager into downloaded games.
                         Checks index.html; skips games that already have it. Scans DIR
@@ -216,19 +224,19 @@ options:
                         Recursively discovers downloaded games in DIR (defaults to 'downloads/'),
                         re-encodes high-bitrate videos via FFmpeg, and reports before/after storage
                         sizes and savings.
-  --update, --check-updates
+  --update, --check-updates, --check-update
                         Check for game updates via CDN headers, ETags, and version probing.
-                        Scans all games if no URL is provided, or checks a specific game
+                        Scans all games if no URL is given, or checks a specific game.
   --updateall [DIR]     Recursively discovers and checks all game installations inside DIR
-                        (defaults to 'downloads/')
+                        (defaults to 'downloads/').
   -y, --yes             Automatically accept update prompts and download detected updates
-                        without confirmation
+                        without confirmation.
   --diff, --differential
                         Perform differential update check on existing assets (re-verifies
-                        remote sizes/hashes and re-downloads modified files)
+                        remote sizes/hashes and re-downloads modified files).
   -o, --folder, --out DIR
                         Custom output directory name (e.g. '.', 'advancements', 'special_downloads/here').
-                        Overrides default 'downloads/<engine_type>/<Game_Name>-<Version>')
+                        Overrides default 'downloads/<engine>/<name>' path.
   --play-now, --stream  Play immediately! Starts an on-demand caching server and streams
                         missing assets live while downloading in background
   --stream-only, --lazy Conserve bandwidth: launches game server and streams assets ONLY

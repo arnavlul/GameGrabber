@@ -2820,9 +2820,9 @@ class GameCatalog:
         """
         Saves metadata & version into catalog as Archived, then safely deletes local files to reclaim disk space.
         Supports:
-        - The name displayed in the catalog (e.g. "Seven Sins", "Between Rounds")
-        - Exact folder names (e.g. "Seven_Sins-v1.10")
-        - Directory paths (e.g. "downloads/html/Seven_Sins-v1.10")
+        - The name displayed in the catalog (e.g. "Game Title")
+        - Exact folder names (e.g. "Folder name")
+        - Directory paths (e.g. "downloads/html/Game_Folder-v1.0")
         If multiple versions exist on disk, displays all versions and prompts which one to archive.
         """
         catalog = cls.load_catalog()
@@ -4470,33 +4470,33 @@ Examples:
   python scraper.py --updateall -y
 
   # Check if a specific game has an update:
-  python scraper.py "Seven_Sins-v1.10" --update
-  python scraper.py "Seven_Sins-v1.10" --update -y
-  python scraper.py "https://gamcore.com/games/seven_sins" --update
+  python scraper.py "Folder name" --update
+  python scraper.py "Folder name" --update -y
+  python scraper.py "URL" --update
 
   # Force differential verification / check on existing assets:
-  python scraper.py "Seven_Sins-v1.10" --diff
+  python scraper.py "Folder name" --diff
 
   # Stop after 250 MB downloaded (safe for limited data plans, resumable anytime):
-  python scraper.py "https://game-portal.com/games/space-adventure" --limit 250
+  python scraper.py "URL" --limit 250
 
   # Compress videos with FFmpeg across all downloaded games (or specific directory):
   python scraper.py --compact
   python scraper.py --compact "downloads/html"
-  python scraper.py --compact "The_DICKtator-v2.5.1"
+  python scraper.py --compact "Folder name"
 
   # Detect and inject Auto-Audio focus manager across all games (or specific game/dir):
   python scraper.py --audio-fix
   python scraper.py --audio-fix "downloads/html"
-  python scraper.py --audio-fix "Candid_Urban_Muffs-v0.78"
+  python scraper.py --audio-fix "Folder name"
 
   # Archive a game to reclaim disk space (keeps version and URLs in catalog, deletes local folder):
-  python scraper.py --archive "Fairytale-v1.0"
-  python scraper.py --archive "Fairytale-v1.0" -y
+  python scraper.py --archive "Folder name"
+  python scraper.py --archive "Folder name" -y
 
   # Register a game in catalog WITHOUT deleting files on disk:
-  python scraper.py --register "Seven_Sins-v1.10"
-  python scraper.py --register "https://gamcore.com/games/college_daze"
+  python scraper.py --register "Folder name"
+  python scraper.py --register "URL"
 
   # Sync all existing downloads & tracking log into game_catalog.json:
   python scraper.py --sync-catalog
