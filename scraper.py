@@ -4955,9 +4955,9 @@ Examples:
   # Scrape a web game directly (saved into <Game_Name>-<Version>):
   python scraper.py "https://game-portal.com/games/space-adventure"
 
-  # Download to a specific custom directory (e.g. current directory '.', 'advancements', or 'special_downloads/here'):
+  # Download to a specific custom directory (e.g. current directory '.', 'my_game', or 'special_downloads/here'):
   python scraper.py "https://game-portal.com/games/space-adventure" .
-  python scraper.py "https://game-portal.com/games/space-adventure" advancements
+  python scraper.py "https://game-portal.com/games/space-adventure" my_game
   python scraper.py "https://game-portal.com/games/space-adventure" special_downloads/here
 
   # Resume an interrupted download (automatically purges corrupt files and skips cached ones):
@@ -5016,7 +5016,7 @@ Examples:
     )
 
     parser.add_argument("url", nargs="?", default=None, help="Target URL (Game portal page URL or direct game iframe/CDN URL) or local downloaded game directory")
-    parser.add_argument("dest", nargs="?", default=None, help="Optional custom destination directory (e.g. '.', 'advancements', 'special_downloads/here'). Overrides default 'downloads/<engine>/<name>' path.")
+    parser.add_argument("dest", nargs="?", default=None, help="Optional custom destination directory (e.g. '.', 'my_game', 'special_downloads/here'). Overrides default 'downloads/<engine>/<name>' path.")
     parser.add_argument("--register", "--track", dest="register", type=str, metavar="TARGET", default=None, help="Explicitly register a game folder or online URL into the persistent catalog WITHOUT deleting local files.")
     parser.add_argument("--archive", dest="archive", type=str, metavar="TARGET", default=None, help="Archive a game: records versions and URLs into catalog/DOWNLOADED_GAMES.md, then safely deletes local files to reclaim disk space.")
     parser.add_argument("--sync-catalog", dest="sync_catalog", action="store_true", help="Scans existing downloads and tracking log to synchronize 'game_catalog.json' and 'DOWNLOADED_GAMES.md'.")
@@ -5028,7 +5028,7 @@ Examples:
     parser.add_argument("-y", "--yes", dest="auto_yes", action="store_true", help="Automatically accept update prompts and download detected updates without confirmation.")
     parser.add_argument("--diff", "--differential", action="store_true", help="Perform differential update check on existing assets (re-verifies remote sizes/hashes and re-downloads modified files).")
     parser.add_argument("--size", "--estimate", dest="estimate_size", action="store_true", help="Estimate total download size and asset count without downloading files.")
-    parser.add_argument("-o", "--folder", "--out", dest="folder", type=str, metavar="DIR", help="Custom output directory name (e.g. '.', 'advancements', 'special_downloads/here'). Overrides default 'downloads/<engine>/<name>' path.")
+    parser.add_argument("-o", "--folder", "--out", dest="folder", type=str, metavar="DIR", help="Custom output directory name (e.g. '.', 'my_game', 'special_downloads/here'). Overrides default 'downloads/<engine>/<name>' path.")
     parser.add_argument("--play-now", "--stream", dest="play_now", action="store_true", help="Play immediately! Starts an on-demand caching server and streams missing assets live while downloading in background")
     parser.add_argument("--stream-only", "--lazy", dest="stream_only", action="store_true", help="Conserve bandwidth: launches game server and streams assets ONLY on-demand as you play (disables background pre-downloading)")
     parser.add_argument("--no-videos", "--images-only", dest="no_videos", action="store_true", help="Conserve bandwidth: downloads all images/audio/text but skips heavy video files (.mp4/.webm)")

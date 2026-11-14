@@ -23,7 +23,7 @@ Universal browser game downloader and offline player. Download, archive, and pre
 - **Instant Offline Runners:** Automatically writes `run_game.bat` and `run_game.py` (an RFC 7233 compliant multithreaded Range server) into the output directory for smooth seeking and playback.
 - **Auto-Audio Focus Manager (`--audio-fix`):** Engine-agnostic viewport audio manager that un-mutes visible on-screen HTML5 video cutscenes, unlocks modern browser autoplay policies on first user interaction, sets volume to 1.0, and mutes off-screen media. Automatically injected into `index.html` on download and retroactively verifiable across your game library via `--audio-fix`.
 - **Lightweight Update Detection (`--update` & `--updateall`):** Check for newer versions and game patches in seconds using lightweight HTTP HEAD requests, ETag comparisons, Last-Modified timestamps, and intelligent CDN version probing without downloading heavy media files.
-- **Cryptographic Differential Updates & Rename Reuse (`--diff`):** Uses RFC 7232 HTTP Conditional Requests (`If-None-Match` $\rightarrow$ `304 Not Modified`) to verify existing assets in a single network round-trip with zero bytes transferred. Automatically seeds assets via hardlinks, maintains a persistent asset manifest in `game_meta.json`, and detects renamed assets via exact MD5 ETag matches with 0% error.
+- **Cryptographic Differential Updates & Rename Reuse (`--diff`):** Uses RFC 7232 HTTP Conditional Requests (`If-None-Match` → `304 Not Modified`) to verify existing assets in a single network round-trip with zero bytes transferred. Automatically seeds assets via hardlinks, maintains a persistent asset manifest in `game_meta.json`, and detects renamed assets via exact MD5 ETag matches with 0% error.
 
 ---
 
@@ -83,13 +83,13 @@ python scraper.py "https://game-portal.com/games/space-adventure" --no-videos
 ```
 
 ### 4. Custom Destination Directory & Parallel Worker Threads
-Specify any destination directory directly as a 2nd argument (e.g. `.`, `advancements`, or `special_downloads/here`), or via `-o` / `--out`:
+Specify any destination directory directly as a 2nd argument (e.g. `.`, `my_game`, or `special_downloads/here`), or via `-o` / `--out`:
 ```bash
 # Download directly into current directory (.):
 python scraper.py "https://game-portal.com/games/space-adventure" .
 
 # Download directly into a custom relative or absolute directory:
-python scraper.py "https://game-portal.com/games/space-adventure" advancements
+python scraper.py "https://game-portal.com/games/space-adventure" my_game
 python scraper.py "https://game-portal.com/games/space-adventure" special_downloads/here
 
 # Using -o / --out with custom threads:
@@ -210,7 +210,7 @@ usage: scraper.py [-h] [--register TARGET] [--archive TARGET] [--sync-catalog]
 
 positional arguments:
   url                   Target URL (Game portal page URL or direct game iframe/CDN URL) or local downloaded game directory
-  dest                  Optional custom destination directory (e.g. '.', 'advancements', 'special_downloads/here').
+  dest                  Optional custom destination directory (e.g. '.', 'my_game', 'special_downloads/here').
                         Overrides default 'downloads/<engine>/<name>' path.
 
 options:
@@ -241,7 +241,7 @@ options:
                         remote sizes/hashes and re-downloads modified files).
   --size, --estimate    Estimate total download size and asset count without downloading files.
   -o, --folder, --out DIR
-                        Custom output directory name (e.g. '.', 'advancements', 'special_downloads/here').
+                        Custom output directory name (e.g. '.', 'my_game', 'special_downloads/here').
                         Overrides default 'downloads/<engine>/<name>' path.
   --play-now, --stream  Play immediately! Starts an on-demand caching server and streams
                         missing assets live while downloading in background
