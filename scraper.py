@@ -941,13 +941,14 @@ class RenPyHandler:
     @staticmethod
     def discover_assets(game_url, captured_urls, session, verify_ssl):
         assets = set()
-        print("[*] Ren'Py Web detected. Probing for Ren'Py web package files...")
+        print("[*] Ren'Py Web detected. Probing for Ren'Py web package files and progressive catalogs...")
 
         standard_renpy_files = [
             'game.zip', 'game.zip.001', 'game.zip.002',
             'renpy.js', 'renpy-pre.js', 'renpy.wasm', 'renpy.data',
             'pyapp-data.js', 'pythonhome-data.js',
-            'package.json', 'progressive_download.txt',
+            'pwa_catalog.json', 'package.json', 'progressive_download.txt',
+            'manifest.json', 'service-worker.js', 'index.html.symbols',
             'web-presplash.png', 'web-presplash.jpg',
             'renpy.png', 'icons/icon-192x192.png', 'icons/icon-512x512.png'
         ]
@@ -975,13 +976,63 @@ class RenPyHandler:
                 except Exception:
                     pass
 
+        # 1. Probe & parse pwa_catalog.json (modern Ren'Py 7.5+ / 8+ PWA progressive web builds)
+        pwa_url = urljoin(game_url, "pwa_catalog.json")
+        try:
+            r = session.get(pwa_url, verify=verify_ssl, timeout=10)
+            if r.status_code == 200:
+                assets.add("pwa_catalog.json")
+                data = r.json()
+                files = data.get("files", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                pwa_count = 0
+                for item in files:
+                    if isinstance(item, str):
+                        c = item.lstrip('/')
+                        if c:
+                            assets.add(c)
+                            pwa_count += 1
+                    elif isinstance(item, dict) and "url" in item:
+                        c = item["url"].lstrip('/')
+                        if c:
+                            assets.add(c)
+                            pwa_count += 1
+                if pwa_count:
+                    print(f"  [+] Discovered {pwa_count} progressive game assets in pwa_catalog.json")
+        except Exception:
+            pass
+
+        # 2. Probe & parse progressive_download.txt (older Ren'Py progressive web builds)
+        prog_url = urljoin(game_url, "progressive_download.txt")
+        try:
+            r = session.get(prog_url, verify=verify_ssl, timeout=10)
+            if r.status_code == 200:
+                assets.add("progressive_download.txt")
+                prog_count = 0
+                for line in r.text.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        parts = line.split()
+                        if parts:
+                            fpath = parts[0].lstrip('/')
+                            if fpath:
+                                assets.add(fpath)
+                                prog_count += 1
+                if prog_count:
+                    print(f"  [+] Discovered {prog_count} progressive assets from progressive_download.txt")
+        except Exception:
+            pass
+
+        # 3. Probe & parse package.json (Emscripten / pyapp Ren'Py builds)
         pkg_url = urljoin(game_url, "package.json")
         try:
             r = session.get(pkg_url, verify=verify_ssl, timeout=5)
             if r.status_code == 200:
+                assets.add("package.json")
                 data = r.json()
-                for item in data.get("files", []):
-                    assets.add(item.lstrip('/'))
+                for key in ["files", "assets", "preload"]:
+                    for item in data.get(key, []):
+                        if isinstance(item, str):
+                            assets.add(item.lstrip('/'))
         except Exception:
             pass
 
@@ -1200,7 +1251,7 @@ class SugarCubeHandler:
             if not c:
                 return None
             c_lower = c.lower()
-            if c_lower.startswith(('images/', 'img/', 'videos/', 'video/', 'sounds/', 'sound/', 'audio/', 'media/', 'assets/')):
+            if c_lower.startswith(('images/', 'img/', 'videos/', 'video/', 'sounds/', 'sound/', 'audio/', 'media/', 'assets/', 'ressources/', 'resource/', 'resources/', 'res/', 'places/', 'people/', 'avatar/', 'game/', 'ui/', 'gui/', 'meta/', 'bg/', 'char/', 'characters/', 'icons/')):
                 return c
             if c_lower.endswith(vid_exts):
                 if video_prefix and not c_lower.startswith(video_prefix.lower()):
@@ -1245,6 +1296,18 @@ class SugarCubeHandler:
                         else:
                             imgs.append(c)
 
+            # SugarCube custom macro tags like ImageSingle / ImageDouble
+            for m in re.finditer(r'<<ImageSingle\s+["\']([^"\']+)["\']\s+["\']([^"\']+)["\']>>', text, re.I):
+                c_char, c_bg = m.group(1).strip(), m.group(2).strip()
+                imgs.append(f"images/char/{c_char}.png")
+                imgs.append(f"images/bg/{c_bg}.jpg")
+
+            for m in re.finditer(r'<<ImageDouble\s+["\']([^"\']+)["\']\s+["\']([^"\']+)["\']\s+["\']([^"\']+)["\']>>', text, re.I):
+                c1, c2, c_bg = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+                imgs.append(f"images/char/{c1}.png")
+                imgs.append(f"images/char/{c2}.png")
+                imgs.append(f"images/bg/{c_bg}.jpg")
+
             # SugarCube macro tags (<<video>>, <<imgbg>>, <<videobg>>, <<char>>, etc.)
             for m in re.finditer(r'<<(?:video|audio|vid|videobg|img|imgbg|char|instapost)\s+[\'"]([^\'"]+)[\'"]', text, re.I):
                 c = resolve_media_path(m.group(1))
@@ -1254,9 +1317,9 @@ class SugarCubeHandler:
                     else:
                         imgs.append(c)
 
-            # Quoted strings with media extensions inside the passage
+            # Quoted or parenthesized strings with media extensions inside the passage
             ext_pattern = '|'.join(MEDIA_EXTENSIONS)
-            for m in re.finditer(r'[\'"]([^\'"\r\n\t<>]+\.(?:' + ext_pattern + r'))[\'"]', text, re.I):
+            for m in re.finditer(r'[\'"`\(]([^\'"`\(\)\r\n\t<>]+\.(?:' + ext_pattern + r'))[\'"`\)]', text, re.I):
                 val = m.group(1).strip()
                 if val.startswith(('http://', 'https://')):
                     p = urlparse(val)
@@ -1313,8 +1376,8 @@ class SugarCubeHandler:
 
         # Step B: Fallback regex scan across global unescaped HTML/scripts
         ext_pattern = '|'.join(MEDIA_EXTENSIONS)
-        for m in re.finditer(r'[\'"]([^\'"\r\n\t<>]+\.(?:' + ext_pattern + r'))[\'"]', unescaped, re.I):
-            token = m.group(1).strip('\'" \t\r\n')
+        for m in re.finditer(r'[\'"`\(]([^\'"`\(\)\r\n\t<>]+\.(?:' + ext_pattern + r'))[\'"`\)]', unescaped, re.I):
+            token = m.group(1).strip('\'"`() \t\r\n')
             if token.startswith(('http://', 'https://')):
                 p = urlparse(token)
                 external_assets[token] = f"external/{p.netloc}{p.path}"
@@ -3398,7 +3461,7 @@ class GameUpdateChecker:
 # MAIN GAME GRABBER ORCHESTRATOR
 # ==============================================================================
 
-def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=8, serve=False, play_now=False, max_workers=8, proxy=None, no_videos=False, stream_only=False, limit_mb=None, diff_check=False, seed_folder=None):
+def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=8, serve=False, play_now=False, max_workers=8, proxy=None, no_videos=False, stream_only=False, limit_mb=None, diff_check=False, seed_folder=None, estimate_size=False):
     verify_ssl = not no_verify
     url = normalize_url(url)
 
@@ -3902,6 +3965,43 @@ if __name__ == "__main__":
         if no_videos and local_rel.lower().endswith(video_exts):
             continue
         asset_map[local_rel] = ext_url
+
+    # If --size or --estimate requested, probe remote sizes across assets and exit without downloading
+    if estimate_size:
+        print("\n" + "=" * 75)
+        print(" GameGrabber - Remote Asset Sizing & Bandwidth Estimation")
+        print("=" * 75)
+        print(f"[*] Total Discovered Assets: {len(asset_map)}")
+        print("[*] Probing remote Content-Length across assets...")
+
+        def _probe_asset_size(item):
+            rel_p, full_u = item
+            try:
+                h = session.head(full_u, verify=verify_ssl, timeout=6, allow_redirects=True)
+                if h.status_code == 200:
+                    cl = h.headers.get('Content-Length')
+                    if cl:
+                        return int(cl), True
+            except Exception:
+                pass
+            return 0, False
+
+        total_bytes = 0
+        valid_count = 0
+        with ThreadPoolExecutor(max_workers=min(32, max_workers * 2)) as ex:
+            probe_results = list(ex.map(_probe_asset_size, asset_map.items()))
+
+        for sz, ok in probe_results:
+            if ok:
+                valid_count += 1
+                total_bytes += sz
+
+        mb = total_bytes / (1024 * 1024)
+        gb = mb / 1024
+        print(f"[+] Valid Remote Assets : {valid_count} / {len(asset_map)}")
+        print(f"[+] Total Size Estimate : {mb:.2f} MB ({gb:.2f} GB)")
+        print("=" * 75 + "\n")
+        return
 
     # 10. If PLAY-NOW mode is enabled, launch On-Demand Caching Server immediately!
     httpd = None
@@ -4519,6 +4619,7 @@ Examples:
     parser.add_argument("--updateall", dest="updateall", nargs="?", const="downloads", default=None, metavar="DIR", help="Recursively discovers and checks all game installations inside DIR (defaults to 'downloads/').")
     parser.add_argument("-y", "--yes", dest="auto_yes", action="store_true", help="Automatically accept update prompts and download detected updates without confirmation.")
     parser.add_argument("--diff", "--differential", action="store_true", help="Perform differential update check on existing assets (re-verifies remote sizes/hashes and re-downloads modified files).")
+    parser.add_argument("--size", "--estimate", dest="estimate_size", action="store_true", help="Estimate total download size and asset count without downloading files.")
     parser.add_argument("-o", "--folder", "--out", dest="folder", type=str, metavar="DIR", help="Custom output directory name (e.g. '.', 'advancements', 'special_downloads/here'). Overrides default 'downloads/<engine>/<name>' path.")
     parser.add_argument("--play-now", "--stream", dest="play_now", action="store_true", help="Play immediately! Starts an on-demand caching server and streams missing assets live while downloading in background")
     parser.add_argument("--stream-only", "--lazy", dest="stream_only", action="store_true", help="Conserve bandwidth: launches game server and streams assets ONLY on-demand as you play (disables background pre-downloading)")
@@ -4723,7 +4824,8 @@ Examples:
                     stream_only=args.stream_only,
                     limit_mb=args.limit,
                     diff_check=True,
-                    seed_folder=local_path
+                    seed_folder=local_path,
+                    estimate_size=args.estimate_size
                 )
         else:
             print("\n" + "-" * 80)
@@ -4748,7 +4850,8 @@ Examples:
         no_videos=args.no_videos,
         stream_only=args.stream_only,
         limit_mb=args.limit,
-        diff_check=args.diff
+        diff_check=args.diff,
+        estimate_size=args.estimate_size
     )
 
 if __name__ == "__main__":
