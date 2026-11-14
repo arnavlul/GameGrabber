@@ -7,11 +7,12 @@ Universal browser game downloader and offline player. Download, archive, and pre
 ## 🌟 Key Features
 
 - **Universal Engine Support:**
-  - **Twine / SugarCube:** Sequential story graph traversal (breadth-first from `startnode`), choice branch resolution, and macro asset extraction.
-  - **Ren'Py Web:** Automated detection and archiving of WebAssembly binaries (`renpy.wasm`, `renpy.data`), engine scripts, and `game.zip` packages.
+  - **Twine / SugarCube:** Sequential story graph traversal (breadth-first from `startnode`), dynamic `importScripts` loading, structured action/portrait map parsing, variable/macro expansion, and dynamic media extraction.
+  - **Ren'Py Web:** Automated detection and archiving of WebAssembly binaries (`renpy.wasm`, `renpy.data`), engine scripts, `pwa_catalog.json` / `renpyweb_remote_files.txt` progressive catalogs, and `game.zip` packages (including compiled `.rpyc` fallback scanning).
   - **RPG Maker Web (MV / MZ):** Deep extraction of `data/*.json` manifests, audio, and tile assets.
   - **Construct 2 / 3:** Dynamic asset resolution from runtime data structures (`data.js`, `c2runtime.js`).
-  - **Generic HTML5:** Canvas, WebGL, and custom script assets.
+  - **Generic HTML5:** Recursive HTML/JS/JSON inspection, Canvas, WebGL, and custom script assets.
+- **Remote Size Estimation (`--size` / `--estimate`):** Inspects remote `Content-Length` headers across all discovered engine assets and prints total asset counts and download size estimates without creating folders or writing files to disk.
 - **Universal Portal & Iframe Resolver:** Seamlessly resolves games embedded in portals, iframes, and distributed CDNs.
 - **Instant Live Play (`--play-now` / `--stream-only`):** Start playing immediately! Launches a multithreaded local caching proxy that streams assets live from the web while quietly caching them to disk in the background.
 - **Resumable Downloads (RFC 7233):** Downloads use atomic `.part` files with HTTP Range requests (`bytes=start-end`), allowing interrupted downloads to resume exactly where they left off without restarting.
@@ -67,7 +68,11 @@ Launch the game right away while missing assets download in the background:
 python scraper.py "https://game-portal.com/games/space-adventure" --play-now
 ```
 
-### 3. Conserve Bandwidth (`--limit` & `--no-videos`)
+### 3. Estimate Download Size & Conserve Bandwidth (`--size`, `--limit`, `--no-videos`)
+Check total asset count and download size before fetching any files:
+```bash
+python scraper.py "https://game-portal.com/games/space-adventure" --size
+```
 Stop downloading after 250 MB:
 ```bash
 python scraper.py "https://game-portal.com/games/space-adventure" --limit 250
@@ -197,10 +202,10 @@ python scraper.py "Folder name" --update
 ```text
 usage: scraper.py [-h] [--register TARGET] [--archive TARGET] [--sync-catalog]
                   [--catalog] [--audio-fix [DIR]] [--compact [DIR]] [--update]
-                  [--updateall [DIR]] [-y] [--diff] [-o DIR] [--play-now]
-                  [--stream-only] [--no-videos] [--headed] [--no-verify]
-                  [--wait SEC] [--threads N] [--serve] [--limit MB]
-                  [--proxy URL]
+                  [--updateall [DIR]] [-y] [--diff] [--size] [-o DIR]
+                  [--play-now] [--stream-only] [--no-videos] [--headed]
+                  [--no-verify] [--wait SEC] [--threads N] [--serve]
+                  [--limit MB] [--proxy URL]
                   [url] [dest]
 
 positional arguments:
@@ -234,6 +239,7 @@ options:
   --diff, --differential
                         Perform differential update check on existing assets (re-verifies
                         remote sizes/hashes and re-downloads modified files).
+  --size, --estimate    Estimate total download size and asset count without downloading files.
   -o, --folder, --out DIR
                         Custom output directory name (e.g. '.', 'advancements', 'special_downloads/here').
                         Overrides default 'downloads/<engine>/<name>' path.
