@@ -18,6 +18,7 @@ import json
 import html
 import struct
 import shutil
+import base64
 import hashlib
 import zipfile
 import argparse
@@ -1361,26 +1362,33 @@ class SugarCubeHandler:
                     if c:
                         dynamic_assets.add(c)
 
-        # 5. Expand bounded integer variable suffix concatenations (e.g. "avatar/item " + $Var + ".png")
+        # 5. Expand bounded integer or string variable suffix concatenations (e.g. "avatar/item " + $Var + ".png")
         var_concats = re.findall(r'[\'"]([^\'"\r\n]+/)([^\'"\r\n]*?)[\'"]\s*\+\s*(\$[A-Za-z0-9_.]+)\s*\+\s*[\'"](\.[a-z0-9]{2,5})[\'"]', combined, re.I)
         if var_concats:
-            var_int_cache = {}
+            var_val_cache = {}
             for dir_pfx, name_pfx, var_expr, ext in var_concats:
                 if ext.lstrip('.').lower() not in PURE_MEDIA_EXTENSIONS:
                     continue
-                if var_expr not in var_int_cache:
+                if var_expr not in var_val_cache:
                     short_name = var_expr.lstrip('$').split('.')[-1]
                     escaped_v = re.escape(var_expr)
                     nums = [int(x) for x in re.findall(escaped_v + r'\s*(?:=|to|is|gte|gt|lte|lt|===|==|>=|<=)\s*(\d+)\b', combined)]
                     nums += [int(x) for x in re.findall(r'\b' + re.escape(short_name) + r'\s*:\s*(\d+)\b', combined)]
                     small_nums = [n for n in nums if 0 <= n <= 20]
+                    vals = []
                     if small_nums and (max(small_nums) - min(small_nums)) <= 10:
                         hi = max(small_nums) + (1 if re.search(escaped_v + r'\s*(?:\+=|\+\+)', combined) else 0)
-                        var_int_cache[var_expr] = list(range(min(small_nums), min(hi, 12) + 1))
+                        vals = [str(idx) for idx in range(min(small_nums), min(hi, 12) + 1)]
                     else:
-                        var_int_cache[var_expr] = []
-                for idx in var_int_cache[var_expr]:
-                    c = clean_relative_path(f"{dir_pfx}{name_pfx}{idx}{ext}")
+                        str_vals = re.findall(escaped_v + r'\s*(?:=|to|is|===|==)\s*[\'"]([A-Za-z0-9_-]{1,32})[\'"]', combined)
+                        for sv in str_vals:
+                            if sv not in vals:
+                                vals.append(sv)
+                            if len(vals) >= 30:
+                                break
+                    var_val_cache[var_expr] = vals
+                for val in var_val_cache[var_expr]:
+                    c = clean_relative_path(f"{dir_pfx}{name_pfx}{val}{ext}")
                     if c:
                         dynamic_assets.add(c)
 
@@ -1389,6 +1397,104 @@ class SugarCubeHandler:
             val = m.group(1).strip()
             if "." in val and ("/" in val or any(val.lower().endswith(ext) for ext in ['.webp', '.png', '.jpg', '.webm', '.mp4', '.ogg', '.mp3'])):
                 dynamic_assets.add(val.replace('\\', '/').lstrip('/'))
+
+        # 7. Expand JS template literals containing ${...} placeholders (e.g. setup.portraitSrc & _od face paths)
+        ext_pattern = '|'.join(sorted(PURE_MEDIA_EXTENSIONS, key=len, reverse=True))
+        tmpl_regex = re.compile(r'`([^`\r\n]{3,260}\.(?:' + ext_pattern + r'))`', re.I)
+        prop_val_cache = {}
+        var_str_cache = {}
+        seen_templates = set()
+        for tm in tmpl_regex.finditer(combined):
+            raw_tmpl = tm.group(1).strip()
+            if '${' not in raw_tmpl or '<' in raw_tmpl or '>' in raw_tmpl or raw_tmpl.startswith(('http://', 'https://')):
+                continue
+            if raw_tmpl in seen_templates:
+                continue
+            seen_templates.add(raw_tmpl)
+            placeholders = list(re.finditer(r'\$\{([^}\r\n]+)\}', raw_tmpl))
+            if not placeholders or len(placeholders) > 3:
+                continue
+
+            options_per_slot = []
+            possible = True
+            for ph in placeholders:
+                expr = ph.group(1).strip()
+                slot_opts = []
+
+                # Case A: Ternary / string literals inside ${...} (e.g. cond ? "/old" : "")
+                if '?' in expr or ':' in expr:
+                    lits = re.findall(r'[\'"]([A-Za-z0-9_./-]{0,40})[\'"]', expr)
+                    for lit in lits:
+                        if lit not in slot_opts:
+                            slot_opts.append(lit)
+                    # Put empty string first so default/current assets download before optional alternates like /old
+                    if "" in slot_opts:
+                        slot_opts.remove("")
+                        slot_opts.insert(0, "")
+
+                # Case B: Property access ${obj.prop} -> gather clean values from object literals (`prop: "val"`)
+                if not slot_opts:
+                    m_prop = re.match(r'^[A-Za-z_$][\w$]*\.([A-Za-z_]\w*)$', expr)
+                    if m_prop:
+                        prop_name = m_prop.group(1)
+                        if prop_name not in prop_val_cache:
+                            found_vals = []
+                            for mv in re.finditer(r'\b' + re.escape(prop_name) + r'\s*:\s*[\'"]([A-Za-z0-9_/-]{1,40})[\'"]', combined):
+                                v_str = mv.group(1).strip()
+                                if v_str not in found_vals:
+                                    found_vals.append(v_str)
+                                    if len(found_vals) >= 150:
+                                        break
+                            prop_val_cache[prop_name] = found_vals
+                        slot_opts = prop_val_cache[prop_name]
+
+                # Case C: Simple local/story variable ${var} -> gather string assignments (`_od to "/old"`, `var = ""`)
+                if not slot_opts and re.match(r'^[\$A-Za-z_][\w$.]*$', expr):
+                    if expr not in var_str_cache:
+                        ev = re.escape(expr)
+                        found_v = []
+                        for mv in re.finditer(r'(?:<<set\s+' + ev + r'\s+to|\b' + ev + r'\s*(?:=|===|==|to))\s*[\'"]([A-Za-z0-9_./-]{0,40})[\'"]', combined):
+                            v_str = mv.group(1)
+                            if v_str not in found_v:
+                                found_v.append(v_str)
+                                if len(found_v) >= 25:
+                                    break
+                        if "" in found_v:
+                            found_v.remove("")
+                            found_v.insert(0, "")
+                        var_str_cache[expr] = found_v
+                    slot_opts = var_str_cache[expr]
+
+                if not slot_opts:
+                    possible = False
+                    break
+                options_per_slot.append(slot_opts)
+
+            if not possible:
+                continue
+
+            total_combos = 1
+            for opts in options_per_slot:
+                total_combos *= len(opts)
+                if total_combos > 300:
+                    possible = False
+                    break
+            if not possible:
+                continue
+
+            expanded = [raw_tmpl]
+            for ph, opts in zip(placeholders, options_per_slot):
+                token = ph.group(0)
+                next_expanded = []
+                for base_str in expanded:
+                    for opt in opts:
+                        next_expanded.append(base_str.replace(token, opt, 1))
+                expanded = next_expanded
+
+            for cand in expanded:
+                c = clean_relative_path(cand.replace('//', '/'))
+                if c:
+                    dynamic_assets.add(c)
 
         return dynamic_assets
 
@@ -1472,12 +1578,17 @@ class SugarCubeHandler:
         name_to_passage = {name: (pid, p_body) for pid, name, p_body in passages_raw}
 
         # 2. Build Story Graph
+        all_passage_names = set(name_to_passage.keys())
         story_graph = {}
         for pid, name, p_text in passages_raw:
             p_unescaped = html.unescape(p_text)
             links = []
+
+            # 2a. Twine standard and setter links [[text|target][$var=1]] or [[target][$var=1]]
             for l_match in re.finditer(r'\[\[(.*?)\]\]', p_unescaped):
                 link_content = l_match.group(1).strip()
+                if '[' in link_content:
+                    link_content = link_content.split('[', 1)[0].rstrip(']').strip()
                 if '->' in link_content:
                     target = link_content.split('->', 1)[1].strip()
                 elif '<-' in link_content:
@@ -1486,15 +1597,39 @@ class SugarCubeHandler:
                     target = link_content.split('|', 1)[1].strip()
                 else:
                     target = link_content
-                if target:
+                if target and target in all_passage_names and target not in links:
                     links.append(target)
+
+            # 2b. SugarCube <<button>> and <<link>> macros with explicit targets or nested <<goto>>
             for m_link in re.finditer(r'<<(?:link|button)\s+[\'"][^\'"]+[\'"](?:\s+[\'"]([^\'"]+)[\'"])?', p_unescaped):
                 if m_link.group(1):
-                    links.append(m_link.group(1).strip())
+                    t = m_link.group(1).strip()
+                    if t in all_passage_names and t not in links:
+                        links.append(t)
+
             for m_goto in re.finditer(r'<<(?:goto|include|display)\s+[\'"]([^\'"]+)[\'"]', p_unescaped):
-                links.append(m_goto.group(1).strip())
+                t = m_goto.group(1).strip()
+                if t in all_passage_names and t not in links:
+                    links.append(t)
+
+            # 2c. HTML data-passage attributes on buttons, links, divs, and spans
             for m_data in re.finditer(r'data-passage=[\'"]([^\'"]+)[\'"]', p_unescaped):
-                links.append(m_data.group(1).strip())
+                t = m_data.group(1).strip()
+                if t in all_passage_names and t not in links:
+                    links.append(t)
+
+            # 2d. JavaScript programmatic navigation calls (Engine.play, SugarCube.Engine.play, state.display, Story.get)
+            for m_js in re.finditer(r'(?:Engine\.play|SugarCube\.Engine\.play|state\.display|Story\.get)\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)', p_unescaped):
+                t = m_js.group(1).strip()
+                if t in all_passage_names and t not in links:
+                    links.append(t)
+
+            # 2e. Quoted identifier fallback matching known story passage names
+            for m_str in re.finditer(r'[\'"]([a-zA-Z0-9_\- ]{3,45})[\'"]', p_unescaped):
+                cand = m_str.group(1).strip()
+                if cand in all_passage_names and cand != name and cand not in links:
+                    links.append(cand)
+
             story_graph[name] = links
 
         # 3. Determine story start node
@@ -1670,6 +1805,32 @@ class SugarCubeHandler:
             return imgs, vids
 
         seen_assets = set()
+        ext_pattern = '|'.join(sorted(PURE_MEDIA_EXTENSIONS, key=len, reverse=True))
+        dynamic_candidates = SugarCubeHandler.discover_dynamic_assets(html_content, extra_text=extra_text, image_prefix=image_prefix)
+
+        # Step A0: Collect global UI, icons, logos, avatars, and profile pictures first so UI loads on frame 1
+        ui_keywords = ('profilpicture', 'profil', 'avatar', 'icon', 'logo', 'button', 'menu', 'ui/', 'hud/', 'subscribestar', 'banner', 'favicon', 'fast-travel', '/face.')
+        for m in re.finditer(r'[\'"`\(]([^\'"`\(\)\r\n\t<>]+\.(?:' + ext_pattern + r'))[\'"`\)]', unescaped, re.I):
+            tok = m.group(1).strip('\'"`() \t\r\n')
+            tok_lower = tok.lower()
+            if any(k in tok_lower for k in ui_keywords) and not tok.startswith(('http://', 'https://')):
+                c = resolve_media_path(tok)
+                if c and c not in seen_assets:
+                    seen_assets.add(c)
+                    discovered_assets.append(c)
+
+        # Promote dynamic UI/avatar assets (e.g., setup.portraitSrc, _od face portraits, fast-travel) into Step A0
+        # Sort primary assets ahead of '/old/' alternate skin directories
+        ui_dynamic = []
+        for dyn in dynamic_candidates:
+            c = resolve_media_path(dyn)
+            if c and any(k in c.lower() for k in ui_keywords):
+                ui_dynamic.append(c)
+        ui_dynamic.sort(key=lambda p: (1 if '/old/' in p.lower() else 0, p))
+        for c in ui_dynamic:
+            if c not in seen_assets:
+                seen_assets.add(c)
+                discovered_assets.append(c)
 
         # Step A: Collect story passages in priority order (images/audio first, then videos)
         for p_name in ordered_passages:
@@ -1691,9 +1852,8 @@ class SugarCubeHandler:
                 seen_assets.add(js_rel)
                 discovered_assets.append(js_rel)
 
-        # Step A2: Dynamic asset templates (pools, action maps, setup dictionaries, random/var expansions)
-        dynamic_candidates = SugarCubeHandler.discover_dynamic_assets(html_content, extra_text=extra_text, image_prefix=image_prefix)
-        for dyn in dynamic_candidates:
+        # Step A2: Remaining dynamic asset templates (pools, action maps, setup dictionaries, random/var expansions)
+        for dyn in sorted(dynamic_candidates):
             c = resolve_media_path(dyn)
             if c and c not in seen_assets:
                 seen_assets.add(c)
@@ -1913,6 +2073,61 @@ class HTML5Handler:
             if not text:
                 continue
 
+            # Auto-unpack XOR-packed / base64-encoded JS payloads (e.g. Bayview var k=[...]; var u="..."; eval(...))
+            m_k = re.search(r'var\s+k\s*=\s*\[([0-9, ]+)\];', text)
+            m_u = re.search(r'var\s+u\s*=\s*["\']([A-Za-z0-9+/=]{100,})["\'];', text)
+            if m_k and m_u:
+                try:
+                    k_bytes = [int(x.strip()) for x in m_k.group(1).split(',') if x.strip()]
+                    u_b64 = m_u.group(1)
+                    raw_s = base64.b64decode(u_b64)
+                    unpacked_js = bytes([b ^ k_bytes[i % len(k_bytes)] for i, b in enumerate(raw_s)]).decode('utf-8', errors='ignore')
+                    if unpacked_js:
+                        text = text + "\n" + unpacked_js
+                except Exception:
+                    pass
+
+            # Detect character layer tables and synthesized creator assets (e.g. Bayview characterLayers.js / LIGHT_LAYER_ROOT)
+            if 'characterlayers' in file_name.lower() or 'light_layer_root' in text.lower() or 'buildcreatorfiles' in text.lower():
+                discovered.add("res/images/characters/player/male.png")
+                discovered.add("res/images/characters/player/female.png")
+                l_root = "res/images/characters/light/"
+
+                skin_tones = ["light-skin", "caramel-skin"]
+                eye_colors = ["brown", "hazel", "blue"]
+                hair_colors = ["brown", "blonde"]
+                clothes_colors = ["black", "white"]
+
+                genders = ["female", "male"]
+                hairs = {"female": ["bob", "long-straight"], "male": ["crop", "textured"]}
+                tops = {"female": ["polo", "henley", "hoodie"], "male": ["polo", "henley", "hoodie"]}
+                bottoms = {"female": ["jeans", "trousers", "skirt"], "male": ["jeans", "trousers", "shorts"]}
+
+                for g in genders:
+                    for tone in skin_tones:
+                        discovered.add(f"{l_root}colors/{g}-ref-{tone}.png")
+                        discovered.add(f"{l_root}{g}-base-{tone}.png")
+                    for eye in eye_colors:
+                        discovered.add(f"{l_root}colors/{g}-eyes-blue-{eye}.png")
+                    for h_slug in hairs.get(g, []):
+                        discovered.add(f"{l_root}{g}-hair-{h_slug}.png")
+                        discovered.add(f"{l_root}{g}-hair-{h_slug}-front.png")
+                        for h_col in hair_colors:
+                            discovered.add(f"{l_root}colors/{g}-hair-{h_slug}-{h_col}.png")
+                            discovered.add(f"{l_root}colors/{g}-hair-{h_slug}-front-{h_col}.png")
+                    for t_slug in tops.get(g, []):
+                        discovered.add(f"{l_root}{g}-top-{t_slug}.png")
+                        discovered.add(f"{l_root}{g}-top-{t_slug}-front.png")
+                        for c_col in clothes_colors:
+                            discovered.add(f"{l_root}colors/modern/{g}-top-{t_slug}-{c_col}.png")
+                            discovered.add(f"{l_root}colors/{g}-top-{t_slug}-{c_col}.png")
+                    for b_slug in bottoms.get(g, []):
+                        discovered.add(f"{l_root}{g}-bottom-{b_slug}.png")
+                        discovered.add(f"{l_root}{g}-bottom-{b_slug}-front.png")
+                        for c_col in clothes_colors:
+                            discovered.add(f"{l_root}colors/modern/{g}-bottom-{b_slug}-{c_col}.png")
+                            discovered.add(f"{l_root}colors/{g}-bottom-{b_slug}-{c_col}.png")
+
             # Detect deep multi-segment and single-segment media root directories in this file
             file_roots = set(re.findall(
                 r'[\'"]((?:res|assets|images|img|videos|media|audio|sounds|ressources|resources|pics|sprites)/(?:[a-zA-Z0-9_.\-]{1,40}/){0,6})[\'"]',
@@ -2110,9 +2325,14 @@ class AssetDownloader:
                     elif r.status_code == 200:
                         ret_etag = r.headers.get("ETag", "").strip('"').lower()
                         ret_len = int(r.headers.get("Content-Length", 0) or 0)
-                        if known_etag and ret_etag == known_etag.lower() and ret_len == os.path.getsize(local_path):
+                        local_size = os.path.getsize(local_path)
+                        # Serverable/S3 multipart ETags end with -<part_count> and do not equal standard local MD5.
+                        # If sizes match and server returned 200 with an identical size, the asset is unchanged!
+                        if (known_etag and ret_etag == known_etag.lower() and ret_len == local_size) or (ret_len > 0 and ret_len == local_size):
                             with self._lock:
                                 self.cached_count += 1
+                                if ret_etag:
+                                    self.manifest[rel_p] = {"etag": ret_etag, "size": local_size, "mtime": mtime}
                             return True, 0, "cached"
 
                         if rel_p.lower() == "index.html":
@@ -2406,7 +2626,7 @@ class AssetDownloader:
         active_futures = {}
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            for _ in range(self.max_workers * 2):
+            for _ in range(self.max_workers):
                 try:
                     rel_path, url = next(items_iter)
                     fut = executor.submit(self.download_file, url, os.path.join(self.download_folder, rel_path))
@@ -3368,11 +3588,23 @@ class GameCatalog:
         return False
 
     @classmethod
-    def list_catalog(cls):
-        """Displays formatted catalog table with multi-version differences and status breakdown."""
+    def list_catalog(cls, sort_by_size=False):
+        """Displays formatted catalog table with multi-version differences, disk sizes, and status breakdown."""
         catalog = cls.load_catalog()
         if not catalog:
             catalog = cls.sync_catalog()
+
+        # Compute disk size for on-disk entries
+        disk_sizes = {}
+        for key, entry in catalog.items():
+            d = entry.get("directory")
+            if entry.get("on_disk") and d and os.path.exists(d):
+                try:
+                    disk_sizes[key] = GameCompactor.get_directory_size(d)
+                except Exception:
+                    disk_sizes[key] = 0
+            else:
+                disk_sizes[key] = 0
 
         # Group entries by normalized game title to analyze version differences
         title_groups = {}
@@ -3414,26 +3646,41 @@ class GameCatalog:
                 for key, e in entries:
                     version_notes[key] = f"Tracked: {', '.join(set(all_versions))}"
 
-        sorted_items = sorted(catalog.items(), key=lambda x: (not x[1].get('on_disk', False), x[1].get('title', '')))
+        def _fmt_size(b):
+            if not b:
+                return "-"
+            if b < 1024 * 1024:
+                return f"{b / 1024:.1f} KB"
+            elif b < 1024 * 1024 * 1024:
+                return f"{b / (1024 * 1024):.1f} MB"
+            else:
+                return f"{b / (1024 * 1024 * 1024):.2f} GB"
 
-        print("\n" + "=" * 105)
-        print(f" GameGrabber - Persistent Game Catalog ({len(catalog)} Tracked Games)")
-        print("=" * 105)
-        print(f"{'Game Title':<32} | {'Version':<10} | {'Status':<24} | {'On Disk':<7} | {'Version Details'}")
-        print("-" * 105)
+        if sort_by_size:
+            sorted_items = sorted(catalog.items(), key=lambda x: (disk_sizes.get(x[0], 0), x[1].get('title', '')), reverse=True)
+        else:
+            sorted_items = sorted(catalog.items(), key=lambda x: (not x[1].get('on_disk', False), x[1].get('title', '')))
+
+        print("\n" + "=" * 115)
+        sort_note = " (Sorted by Disk Size Descending)" if sort_by_size else ""
+        print(f" GameGrabber - Persistent Game Catalog ({len(catalog)} Tracked Games){sort_note}")
+        print("=" * 115)
+        print(f"{'Game Title':<28} | {'Version':<9} | {'Status':<22} | {'Disk Size':<10} | {'On Disk':<7} | {'Version Details'}")
+        print("-" * 115)
         for key, entry in sorted_items:
             title = entry.get("title", key)
             ver = entry.get("version", "v1.0")
             st = entry.get("status", "Unknown")
+            sz_str = _fmt_size(disk_sizes.get(key, 0)) if entry.get("on_disk") else "Archived"
             on_d = "YES" if entry.get("on_disk", False) else "NO"
             v_note = version_notes.get(key, "")
-            print(f"{title[:32]:<32} | {ver:<10} | {st[:24]:<24} | {on_d:<7} | {v_note}")
-        print("=" * 105)
+            print(f"{title[:28]:<28} | {ver:<9} | {st[:22]:<22} | {sz_str:<10} | {on_d:<7} | {v_note}")
+        print("=" * 115)
 
         # Highlight multi-version games on disk
         multi_disk = {t: ents for t, ents in title_groups.items() if len([e for _, e in ents if e.get("on_disk", False)]) > 1}
         if multi_disk:
-            print("\n" + "-" * 105)
+            print("\n" + "-" * 115)
             print(" 📌 MULTI-VERSION GAMES DETECTED ON DISK:")
             for t_norm, ents in multi_disk.items():
                 title_name = ents[0][1].get("title")
@@ -3444,8 +3691,115 @@ class GameCatalog:
                     tag = "(Latest)" if idx == 0 else "(Older)"
                     print(f"    - {e.get('version'):<10} {tag:<8} -> {e.get('directory', 'N/A')}")
                 print(f"    💡 To archive an older version and reclaim space: python scraper.py --archive \"{title_name}\"")
-            print("-" * 105)
+            print("-" * 115)
         print()
+
+    @classmethod
+    def report_size(cls, target=None, probe_remote=False, verify_ssl=True, max_workers=8):
+        """
+        Reports total download and disk size for a game, folder, category, or all downloads without downloading.
+        """
+        def _fmt_size(b):
+            if not b:
+                return "0 B"
+            if b < 1024 * 1024:
+                return f"{b / 1024:.1f} KB"
+            elif b < 1024 * 1024 * 1024:
+                return f"{b / (1024 * 1024):.1f} MB"
+            else:
+                return f"{b / (1024 * 1024 * 1024):.2f} GB"
+
+        # Case 1: Remote URL
+        if target and target.startswith(("http://", "https://")):
+            grab_game(
+                url=target,
+                estimate_size=True,
+                no_verify=not verify_ssl,
+                max_workers=max_workers
+            )
+            return
+
+        # Case 2: Matching local game or catalog game
+        if target and target not in ["downloads", "downloads/", "downloads/html", "downloads/renpy", "html", "renpy"]:
+            matches = cls.find_matching_disk_games(target)
+            if matches:
+                m = matches[0]
+                d_path = m["dir"]
+                title = m["title"]
+                ver = m["version"]
+                size_bytes = m["size"]
+                file_count = sum(len(f_list) for _, _, f_list in os.walk(d_path))
+                print("\n" + "=" * 80)
+                print(" GameGrabber - Local Game Size & Storage Breakdown")
+                print("=" * 80)
+                print(f"[*] Game Title       : {title}")
+                print(f"[*] Detected Version : {ver}")
+                print(f"[*] Directory        : {os.path.abspath(d_path)}")
+                print(f"[+] Local Disk Size  : {_fmt_size(size_bytes)} across {file_count:,} files")
+
+                # Check for remote URL
+                meta = m.get("meta", {})
+                cat = cls.load_catalog()
+                cat_e = cat.get(m["folder"], {})
+                remote_url = meta.get("game_url") or meta.get("cdn_url") or meta.get("source_url") or cat_e.get("cdn_url") or cat_e.get("portal_url")
+                if remote_url:
+                    print(f"[*] Remote Origin URL: {remote_url}")
+                    if probe_remote:
+                        print("-" * 80)
+                        print("[*] Probing remote asset size from origin CDN...")
+                        try:
+                            grab_game(
+                                url=remote_url,
+                                estimate_size=True,
+                                no_verify=not verify_ssl,
+                                max_workers=max_workers
+                            )
+                        except Exception as ex:
+                            print(f"[!] Remote size probe error: {ex}\n")
+                    else:
+                        print(f"[*] To probe remote CDN download size: python scraper.py \"{remote_url}\" --size")
+                print("=" * 80 + "\n")
+                return
+
+        # Case 3: Scan directory (defaults to downloads/ or target directory)
+        scan_dir = target if (target and os.path.isdir(target)) else "downloads"
+        print("\n" + "=" * 90)
+        print(f" GameGrabber - Local Game Sizes & Storage Report ({scan_dir})")
+        print("=" * 90)
+
+        disk_dirs = GameUpdateChecker.find_game_directories(scan_dir) if os.path.exists(scan_dir) else []
+        if not disk_dirs:
+            print(f"[!] No downloaded game installations found in '{scan_dir}'.\n")
+            return
+
+        game_sizes = []
+        total_disk_bytes = 0
+        total_files = 0
+        for gp in disk_dirs:
+            folder = os.path.basename(gp)
+            try:
+                sz = GameCompactor.get_directory_size(gp)
+                cnt = sum(len(f_list) for _, _, f_list in os.walk(gp))
+            except Exception:
+                sz = 0
+                cnt = 0
+            ver = cls.detect_version_from_folder(gp)
+            raw_t = re.sub(r'-(v[0-9]+(?:\.[0-9a-zA-Z_\-]+)*)$', '', folder, flags=re.I)
+            raw_t = re.sub(r'[\s\-_]v?\d+(?:\.[\d\w\-]+)+$', '', raw_t, flags=re.I)
+            title = raw_t.replace('_', ' ').strip()
+            game_sizes.append((sz, cnt, title, ver, folder, gp))
+            total_disk_bytes += sz
+            total_files += cnt
+
+        game_sizes.sort(key=lambda x: x[0], reverse=True)
+
+        print(f"{'Game Title':<32} | {'Version':<9} | {'Disk Size':<11} | {'Files':<8} | {'Folder'}")
+        print("-" * 90)
+        for sz, cnt, title, ver, folder, gp in game_sizes:
+            print(f"{title[:32]:<32} | {ver:<9} | {_fmt_size(sz):<11} | {cnt:<8,} | {folder}")
+        print("=" * 90)
+        print(f"[+] Total Storage Used : {_fmt_size(total_disk_bytes)} across {len(game_sizes)} game(s) ({total_files:,} total files)")
+        print("=" * 90 + "\n")
 
     @classmethod
     def sync_markdown(cls, catalog=None):
@@ -4055,9 +4409,29 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
     else:
         print(f"[*] Sizing Mode: Inspecting remote assets without modifying '{target_folder}'.")
 
-    # 6. Engine-Specific Asset Discovery
-    discovered_assets = set()
+    # 6. Engine-Specific Asset Discovery (preserve sequential order rather than hashing via set())
+    discovered_assets = []
+    _discovered_seen = set()
+
+    def _add_discovered_asset(rel_p):
+        if rel_p and rel_p not in _discovered_seen:
+            _discovered_seen.add(rel_p)
+            discovered_assets.append(rel_p)
+
     external_assets = {}
+
+    # Queue runtime-captured boot assets first so startup scripts/styles/images never lag behind
+    parsed_game_url = urlparse(game_url)
+    base_game_dir = os.path.dirname(parsed_game_url.path)
+    if not base_game_dir.endswith('/'):
+        base_game_dir += '/'
+
+    for cap_url in captured_urls:
+        p = urlparse(cap_url)
+        if p.netloc == parsed_game_url.netloc and p.path.startswith(base_game_dir):
+            rel = p.path[len(base_game_dir):].lstrip('/')
+            c = clean_relative_path(rel)
+            _add_discovered_asset(c)
 
     if detected_engine == "renpy":
         renpy_assets = RenPyHandler.discover_assets(
@@ -4069,20 +4443,24 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
             captured_responses=captured_responses,
             local_folder=None if estimate_size else target_folder
         )
-        discovered_assets.update(renpy_assets)
+        for a in sorted(renpy_assets):
+            _add_discovered_asset(a)
 
     elif detected_engine in ["sugarcube", "twine"]:
         sc_assets, sc_external = SugarCubeHandler.parse_story(page_html, game_url, engine_info, session=session, verify_ssl=verify_ssl)
-        discovered_assets.update(sc_assets)
+        for a in sc_assets:
+            _add_discovered_asset(a)
         external_assets.update(sc_external)
 
     elif detected_engine == "rpgmaker":
         rpg_assets = RPGMakerHandler.discover_assets(game_url, session, verify_ssl)
-        discovered_assets.update(rpg_assets)
+        for a in sorted(rpg_assets):
+            _add_discovered_asset(a)
 
     elif detected_engine == "construct":
         c_assets = ConstructHandler.discover_assets(game_url, session, verify_ssl)
-        discovered_assets.update(c_assets)
+        for a in sorted(c_assets):
+            _add_discovered_asset(a)
 
     else:
         html5_assets = HTML5Handler.discover_assets(
@@ -4093,21 +4471,8 @@ def grab_game(url, output_folder=None, headed=False, no_verify=False, wait_idle=
             captured_urls=captured_urls,
             captured_responses=captured_responses
         )
-        discovered_assets.update(html5_assets)
-
-    # Include all captured same-origin assets from Playwright
-    parsed_game_url = urlparse(game_url)
-    base_game_dir = os.path.dirname(parsed_game_url.path)
-    if not base_game_dir.endswith('/'):
-        base_game_dir += '/'
-
-    for cap_url in captured_urls:
-        p = urlparse(cap_url)
-        if p.netloc == parsed_game_url.netloc and p.path.startswith(base_game_dir):
-            rel = p.path[len(base_game_dir):].lstrip('/')
-            c = clean_relative_path(rel)
-            if c:
-                discovered_assets.add(c)
+        for a in sorted(html5_assets):
+            _add_discovered_asset(a)
 
     # 9. Build Download Queue (Preserving Story Order and Filtering if requested)
     asset_map = {}
@@ -4982,6 +5347,13 @@ Examples:
   # Estimate total download size and asset count before downloading:
   python scraper.py "URL" --size
 
+  # Report total storage size of all downloads or specific category (sorted descending):
+  python scraper.py --size
+  python scraper.py --size "downloads/html"
+
+  # Report size for a specific game folder or catalog game:
+  python scraper.py "Folder name" --size
+
   # Stop after 250 MB downloaded (safe for limited data plans, resumable anytime):
   python scraper.py "URL" --limit 250
 
@@ -5021,13 +5393,14 @@ Examples:
     parser.add_argument("--archive", dest="archive", type=str, metavar="TARGET", default=None, help="Archive a game: records versions and URLs into catalog/DOWNLOADED_GAMES.md, then safely deletes local files to reclaim disk space.")
     parser.add_argument("--sync-catalog", dest="sync_catalog", action="store_true", help="Scans existing downloads and tracking log to synchronize 'game_catalog.json' and 'DOWNLOADED_GAMES.md'.")
     parser.add_argument("--catalog", "--list-catalog", dest="list_catalog", action="store_true", help="Display all games tracked in the persistent catalog with version, status, and disk presence.")
+    parser.add_argument("--sort-size", dest="sort_size", action="store_true", help="When viewing --catalog, sort games by disk size in descending order.")
     parser.add_argument("--audio-fix", "--fix-audio", dest="audio_fix", nargs="?", const="downloads", default=None, metavar="DIR", help="Detect and inject Auto-Audio Focus Manager into downloaded games. Checks index.html; skips games that already have it. Scans DIR (defaults to 'downloads/'), or can be pointed to a specific game directory.")
     parser.add_argument("--compact", "--optimize", dest="compact", nargs="?", const="downloads", default=None, metavar="DIR", help="Recursively discovers downloaded games in DIR (defaults to 'downloads/'), re-encodes high-bitrate videos via FFmpeg, and reports before/after storage sizes and savings.")
     parser.add_argument("--update", "--check-updates", "--check-update", dest="update", action="store_true", help="Check for game updates via CDN headers, ETags, and version probing. Scans all games if no URL is given, or checks a specific game.")
     parser.add_argument("--updateall", dest="updateall", nargs="?", const="downloads", default=None, metavar="DIR", help="Recursively discovers and checks all game installations inside DIR (defaults to 'downloads/').")
     parser.add_argument("-y", "--yes", dest="auto_yes", action="store_true", help="Automatically accept update prompts and download detected updates without confirmation.")
     parser.add_argument("--diff", "--differential", action="store_true", help="Perform differential update check on existing assets (re-verifies remote sizes/hashes and re-downloads modified files).")
-    parser.add_argument("--size", "--estimate", dest="estimate_size", action="store_true", help="Estimate total download size and asset count without downloading files.")
+    parser.add_argument("--size", "--estimate", dest="estimate_size", action="store_true", help="Report total download and disk size without downloading files (e.g. 'scraper.py <URL> --size', 'scraper.py <game> --size', or 'scraper.py --size' to scan all downloads sorted descending).")
     parser.add_argument("-o", "--folder", "--out", dest="folder", type=str, metavar="DIR", help="Custom output directory name (e.g. '.', 'my_game', 'special_downloads/here'). Overrides default 'downloads/<engine>/<name>' path.")
     parser.add_argument("--play-now", "--stream", dest="play_now", action="store_true", help="Play immediately! Starts an on-demand caching server and streams missing assets live while downloading in background")
     parser.add_argument("--stream-only", "--lazy", dest="stream_only", action="store_true", help="Conserve bandwidth: launches game server and streams assets ONLY on-demand as you play (disables background pre-downloading)")
@@ -5043,7 +5416,7 @@ Examples:
     args = parser.parse_args()
     custom_dest = args.dest if args.dest is not None else args.folder
 
-    if not args.url and not args.update and args.updateall is None and args.compact is None and args.audio_fix is None and not args.sync_catalog and not args.list_catalog and args.archive is None and args.register is None:
+    if not args.url and not args.update and args.updateall is None and args.compact is None and args.audio_fix is None and not args.sync_catalog and not args.list_catalog and args.archive is None and args.register is None and not args.estimate_size:
         parser.print_help()
         sys.exit(0)
 
@@ -5054,7 +5427,13 @@ Examples:
 
     # Handle --catalog / --list-catalog
     if args.list_catalog:
-        GameCatalog.list_catalog()
+        GameCatalog.list_catalog(sort_by_size=args.sort_size)
+        return
+
+    # Handle --size / --estimate
+    if args.estimate_size:
+        target = args.url or custom_dest
+        GameCatalog.report_size(target=target, verify_ssl=not args.no_verify, max_workers=args.threads)
         return
 
     # Handle --register
